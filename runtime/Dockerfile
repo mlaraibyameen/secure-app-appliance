@@ -67,6 +67,7 @@ ARG APP_RUNTIME_UID=10001
 ARG APP_RUNTIME_GID=10001
 ARG APP_HTTP_PORT=8080
 ARG ORACLE_INSTANTCLIENT_SHORT=19_32
+ARG APP_SOURCE=build/new-admission-portal/1.0.0/app
 
 ENV APP_ROOT=/opt/app \
     APP_DATA=/data \
@@ -123,10 +124,21 @@ RUN set -eux; \
         "${APP_DATA}"; \
     php --ri oci8 >/dev/null
 
+COPY runtime/Caddyfile /etc/caddy/Caddyfile
+COPY runtime/php-fpm-www.conf /usr/local/etc/php-fpm.d/zz-secure-app.conf
+COPY runtime/entrypoint.sh /usr/local/bin/secure-app-entrypoint
+
+COPY ${APP_SOURCE}/ ${APP_ROOT}/
+
+RUN set -eux; \
+    chmod 755 /usr/local/bin/secure-app-entrypoint; \
+    mkdir -p "${APP_ROOT}/bootstrap/cache"; \
+    chown -R "${APP_RUNTIME_UID}:${APP_RUNTIME_GID}" \
+        "${APP_ROOT}/storage" \
+        "${APP_ROOT}/bootstrap/cache"
+
 WORKDIR ${APP_ROOT}
 
 EXPOSE ${APP_HTTP_PORT}
 
-ENTRYPOINT ["/usr/bin/tini", "--"]
-
-CMD ["php-fpm", "-F"]
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/secure-app-entrypoint"]

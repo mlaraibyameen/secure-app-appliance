@@ -1,0 +1,29 @@
+{
+    servers {
+        protocols h1 h2 h3
+    }
+}
+
+:8080 {
+    root * /opt/app/public
+
+    encode zstd gzip
+
+    php_fastcgi 127.0.0.1:9000
+
+    file_server
+}
+
+https://new-admission-portal.local:8443 {
+    tls /run/app-config/tls/ssl.crt /run/app-config/tls/ssl.key {
+        protocols tls1.2 tls1.3
+    }
+
+    root * /opt/app/public
+
+    encode zstd gzip
+
+    php_fastcgi 127.0.0.1:9000
+
+    file_server
+}
