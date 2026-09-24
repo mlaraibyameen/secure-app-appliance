@@ -2,9 +2,9 @@
 ARG PHP_VERSION=8.4.25
 ARG CADDY_VERSION=2.11.4
 
-FROM caddy:${CADDY_VERSION} AS caddy-bin
+FROM public.ecr.aws/docker/library/caddy:${CADDY_VERSION} AS caddy-bin
 
-FROM php:${PHP_VERSION}-fpm-bookworm AS php-builder
+FROM public.ecr.aws/docker/library/php:${PHP_VERSION}-fpm-bookworm AS php-builder
 
 ARG OCI8_VERSION=3.4.1
 ARG PHPREDIS_VERSION=6.3.0
@@ -62,7 +62,7 @@ RUN set -eux; \
     echo "=== PHP OCI8 LOAD CHECK ==="; \
     php --ri oci8
 
-FROM php:${PHP_VERSION}-fpm-bookworm AS runtime
+FROM public.ecr.aws/docker/library/php:${PHP_VERSION}-fpm-bookworm AS runtime
 
 ARG APP_RUNTIME_USER=app
 ARG APP_RUNTIME_UID=10001

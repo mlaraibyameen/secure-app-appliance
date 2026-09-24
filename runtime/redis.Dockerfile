@@ -1,6 +1,6 @@
 ARG REDIS_SERVER_VERSION=8.2.9
 
-FROM redis:${REDIS_SERVER_VERSION}-bookworm
+FROM public.ecr.aws/docker/library/redis:${REDIS_SERVER_VERSION}-bookworm
 
 COPY runtime/redis-entrypoint.sh /usr/local/bin/secure-app-redis
 

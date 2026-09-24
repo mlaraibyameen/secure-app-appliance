@@ -50,9 +50,13 @@ curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
 
 chmod a+r /etc/apt/keyrings/docker.asc
 
-printf '%s\n' \
-    "deb [arch=$ARCH signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu $VERSION_CODENAME stable" \
-    > /etc/apt/sources.list.d/docker.list
+if [ -f /etc/apt/sources.list.d/docker.sources ]; then
+    rm -f /etc/apt/sources.list.d/docker.list
+elif [ ! -f /etc/apt/sources.list.d/docker.list ]; then
+    printf '%s\n' \
+        "deb [arch=$ARCH signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu $VERSION_CODENAME stable" \
+        > /etc/apt/sources.list.d/docker.list
+fi
 
 apt-get update
 

@@ -1,6 +1,6 @@
 services:
   gateway:
-    image: caddy:2.11.4
+    image: public.ecr.aws/docker/library/caddy:2.11.4
     container_name: secure-app-gateway
     restart: unless-stopped
 

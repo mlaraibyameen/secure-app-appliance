@@ -10,7 +10,7 @@ set +a
 
 RUNTIME_IMAGE="secure-app-runtime:$SECURE_RUNTIME_VERSION"
 REDIS_IMAGE="secure-app-redis:$SECURE_RUNTIME_VERSION"
-GATEWAY_IMAGE="caddy:$CADDY_VERSION"
+GATEWAY_IMAGE="public.ecr.aws/docker/library/caddy:$CADDY_VERSION"
 
 echo "=== BUILD SHARED RUNTIME ==="
 echo "RUNTIME_IMAGE=$RUNTIME_IMAGE"
