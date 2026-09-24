@@ -24,6 +24,10 @@ RUN set -eux; \
         unzip \
         libaio1 \
         libnsl2 \
+        libfreetype6-dev \
+        libjpeg62-turbo-dev \
+        libpng-dev \
+        libzip-dev \
         $PHPIZE_DEPS; \
     rm -rf /var/lib/apt/lists/*; \
     curl -fL --retry 3 \
@@ -43,6 +47,8 @@ RUN set -eux; \
     rm -f \
         "/tmp/${ORACLE_BASIC_FILENAME}" \
         "/tmp/${ORACLE_SDK_FILENAME}"; \
+    docker-php-ext-configure gd --with-freetype --with-jpeg; \
+    docker-php-ext-install -j"$(nproc)" gd pdo_mysql zip; \
     printf 'instantclient,/opt/oracle/instantclient_%s\n' \
         "${ORACLE_INSTANTCLIENT_SHORT}" \
         | pecl install "oci8-${OCI8_VERSION}"; \
@@ -79,8 +85,8 @@ COPY --from=php-builder \
     /usr/local/lib/php/extensions/
 
 COPY --from=php-builder \
-    /usr/local/etc/php/conf.d/docker-php-ext-oci8.ini \
-    /usr/local/etc/php/conf.d/docker-php-ext-oci8.ini
+    /usr/local/etc/php/conf.d/ \
+    /usr/local/etc/php/conf.d/
 
 RUN set -eux; \
     rm -rf "/opt/oracle/instantclient_${ORACLE_INSTANTCLIENT_SHORT}/sdk"; \
@@ -89,6 +95,10 @@ RUN set -eux; \
         ca-certificates \
         libaio1 \
         libnsl2 \
+        libfreetype6 \
+        libjpeg62-turbo \
+        libpng16-16 \
+        libzip4 \
         tini; \
     rm -rf /var/lib/apt/lists/*; \
     printf '%s\n' \
