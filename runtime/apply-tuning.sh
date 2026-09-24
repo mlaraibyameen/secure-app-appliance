@@ -86,9 +86,6 @@ require_duration() {
     }
 }
 
-# ------------------------------------------------------------
-# PHP-FPM
-# ------------------------------------------------------------
 
 FPM_PM="$(cfg_get PHP_FPM_PM dynamic)"
 FPM_MAX_CHILDREN="$(cfg_get PHP_FPM_MAX_CHILDREN 10)"
@@ -136,9 +133,6 @@ require_duration PHP_FPM_REQUEST_SLOWLOG_TIMEOUT "$FPM_SLOWLOG_TIMEOUT"
     esac
 } > /usr/local/etc/php-fpm.d/zz-runtime-tuning.conf
 
-# ------------------------------------------------------------
-# PHP / OPcache / APCu
-# ------------------------------------------------------------
 
 PHP_MEMORY_LIMIT="$(cfg_get PHP_MEMORY_LIMIT 512M)"
 PHP_MAX_EXECUTION_TIME="$(cfg_get PHP_MAX_EXECUTION_TIME 120)"

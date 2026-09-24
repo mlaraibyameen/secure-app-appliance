@@ -1,0 +1,165 @@
+#!/bin/sh
+set -eu
+
+usage() {
+    cat <<'USAGE'
+Usage:
+  ./builder/secure-build --test <app-path> <app-slug> <version>
+
+Current mode:
+  --test creates a TEST_PLAINTEXT package for deployment testing.
+
+The final encrypted SWS/protected-loader format will replace this payload later.
+USAGE
+    exit 1
+}
+
+[ "${1:-}" = "--test" ] || usage
+[ "$#" -eq 4 ] || usage
+
+APP_PATH="$(realpath "$2")"
+APP_SLUG="$3"
+APP_VERSION="$4"
+
+echo "$APP_SLUG" | grep -Eq '^[a-z0-9][a-z0-9-]*$' || {
+    echo "ERROR: invalid app slug: $APP_SLUG" >&2
+    exit 1
+}
+
+echo "$APP_VERSION" | grep -Eq '^[A-Za-z0-9._-]+$' || {
+    echo "ERROR: invalid version: $APP_VERSION" >&2
+    exit 1
+}
+
+[ -f "$APP_PATH/artisan" ] || {
+    echo "ERROR: artisan not found: $APP_PATH" >&2
+    exit 1
+}
+
+[ -f "$APP_PATH/public/index.php" ] || {
+    echo "ERROR: public/index.php not found" >&2
+    exit 1
+}
+
+[ -f "$APP_PATH/vendor/autoload.php" ] || {
+    echo "ERROR: vendor/autoload.php not found" >&2
+    exit 1
+}
+
+ROOT="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
+
+WORK="$ROOT/build/packs/$APP_SLUG/$APP_VERSION"
+STAGE="$WORK/app"
+PACKAGE="$WORK/package"
+DIST="$ROOT/dist"
+
+rm -rf "$WORK"
+
+mkdir -p \
+    "$STAGE" \
+    "$PACKAGE/payload" \
+    "$DIST"
+
+echo "==> Staging $APP_SLUG $APP_VERSION"
+
+rsync -a \
+    --delete \
+    --exclude='.git/' \
+    --exclude='.env' \
+    --exclude='.env.*' \
+    --exclude='/storage/***' \
+    --exclude='node_modules/' \
+    --exclude='*.sql' \
+    --exclude='*.tar' \
+    --exclude='*.tar.gz' \
+    --exclude='*.tar.zst' \
+    "$APP_PATH/" \
+    "$STAGE/"
+
+mkdir -p "$STAGE/storage"
+
+rm -rf "$STAGE/public/storage"
+ln -s ../storage/app/public "$STAGE/public/storage"
+
+rm -f "$STAGE/.env"
+ln -s /run/app-config/.env "$STAGE/.env"
+
+echo
+echo "=== SECURITY CHECKS ==="
+
+if [ "$(readlink "$STAGE/.env")" = "/run/app-config/.env" ]; then
+    echo "ENV_SYMLINK=PASS"
+else
+    echo "ENV_SYMLINK=FAIL"
+    exit 1
+fi
+
+if [ -L "$STAGE/public/storage" ] &&
+   [ "$(readlink "$STAGE/public/storage")" = "../storage/app/public" ]; then
+    echo "PUBLIC_STORAGE_LINK=PASS"
+else
+    echo "PUBLIC_STORAGE_LINK=FAIL"
+    exit 1
+fi
+
+if find "$STAGE" -type f -name '.env*' -print -quit | grep -q .; then
+    echo "ENV_FILE_INCLUDED=YES"
+    exit 1
+else
+    echo "ENV_FILE_INCLUDED=NO"
+fi
+
+if find "$STAGE" -type f \( \
+    -name '*.sql' \
+    -o -name '*.tar' \
+    -o -name '*.tar.gz' \
+    -o -name '*.tar.zst' \
+\) -print -quit | grep -q .; then
+    echo "FORBIDDEN_FILE_INCLUDED=YES"
+    exit 1
+else
+    echo "FORBIDDEN_FILE_INCLUDED=NO"
+fi
+
+echo
+echo "==> Creating application payload"
+
+tar \
+    -C "$STAGE" \
+    -czf "$PACKAGE/payload/app.tar.gz" \
+    .
+
+cat > "$PACKAGE/manifest.env" <<EOF_MANIFEST
+SAPP_FORMAT=1
+APP_SLUG=$APP_SLUG
+APP_VERSION=$APP_VERSION
+SECURITY_MODE=TEST_PLAINTEXT
+BUILT_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+EOF_MANIFEST
+
+(
+    cd "$PACKAGE"
+    sha256sum payload/app.tar.gz > checksums.sha256
+)
+
+OUTPUT="$DIST/$APP_SLUG-$APP_VERSION.sapp"
+
+tar \
+    -C "$PACKAGE" \
+    -cf "$OUTPUT" \
+    manifest.env \
+    checksums.sha256 \
+    payload
+
+echo
+echo "=== PACKAGE BUILT ==="
+echo "APP_SLUG=$APP_SLUG"
+echo "APP_VERSION=$APP_VERSION"
+echo "SECURITY_MODE=TEST_PLAINTEXT"
+echo "OUTPUT=$OUTPUT"
+sha256sum "$OUTPUT"
+
+echo
+echo "WARNING:"
+echo "This package is for deployment-plumbing testing only."
+echo "It is NOT the final protected source-code format."

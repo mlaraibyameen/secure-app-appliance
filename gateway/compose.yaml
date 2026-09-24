@@ -1,0 +1,25 @@
+services:
+  gateway:
+    image: caddy:2.11.4
+    container_name: secure-app-gateway
+    restart: unless-stopped
+
+    ports:
+      - "80:80/tcp"
+      - "443:443/tcp"
+      - "443:443/udp"
+
+    volumes:
+      - /srv/secure-apps/_gateway/Caddyfile:/etc/caddy/Caddyfile:ro
+      - /srv/secure-apps/_gateway/apps:/etc/caddy/apps:ro
+      - /srv/secure-apps/_gateway/tls:/etc/caddy/tls:ro
+      - /srv/secure-apps/_gateway/data:/data
+      - /srv/secure-apps/_gateway/config:/config
+
+    networks:
+      - gateway
+
+networks:
+  gateway:
+    external: true
+    name: secure-app-gateway

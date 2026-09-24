@@ -102,7 +102,6 @@ cat > "$REDIS_CONF" <<EOF_REDIS
 bind 0.0.0.0
 port 6379
 
-# Redis is reachable only on the private appliance Docker network.
 protected-mode no
 
 dir /data

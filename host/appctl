@@ -1,0 +1,683 @@
+#!/bin/sh
+set -eu
+
+ROOT="${SECURE_APP_ROOT:-/srv/secure-apps}"
+SHARE="${SECURE_APP_SHARE:-/usr/share/secure-app-appliance}"
+RUNTIME_ENV="${SECURE_APP_RUNTIME_ENV:-/etc/secure-app-appliance/runtime.env}"
+
+GATEWAY_DIR="$ROOT/_gateway"
+GATEWAY_CONTAINER="secure-app-gateway"
+GATEWAY_NETWORK="secure-app-gateway"
+
+die() {
+    echo "ERROR: $*" >&2
+    exit 1
+}
+
+need_root() {
+    [ "$(id -u)" -eq 0 ] || die "run appctl as root"
+}
+
+valid_slug() {
+    echo "$1" | grep -Eq '^[a-z0-9][a-z0-9-]*$'
+}
+
+cfg_get() {
+    file="$1"
+    key="$2"
+    default="$3"
+
+    value="$(
+        awk -v key="$key" '
+            /^[[:space:]]*#/ { next }
+            /^[[:space:]]*$/ { next }
+
+            {
+                line=$0
+                sub(/^[[:space:]]*/, "", line)
+
+                split(line, a, "=")
+                k=a[1]
+                gsub(/[[:space:]]/, "", k)
+
+                if (k == key) {
+                    sub(/^[^=]*=/, "", line)
+                    sub(/^[[:space:]]*/, "", line)
+                    sub(/[[:space:]]*$/, "", line)
+                    print line
+                    exit
+                }
+            }
+        ' "$file"
+    )"
+
+    if [ -n "$value" ]; then
+        printf '%s' "$value"
+    else
+        printf '%s' "$default"
+    fi
+}
+
+load_runtime() {
+    [ -r "$RUNTIME_ENV" ] || \
+        die "runtime metadata missing: $RUNTIME_ENV"
+
+    . "$RUNTIME_ENV"
+
+    : "${RUNTIME_IMAGE:?RUNTIME_IMAGE missing}"
+    : "${REDIS_IMAGE:?REDIS_IMAGE missing}"
+}
+
+app_root() {
+    printf '%s/%s' "$ROOT" "$1"
+}
+
+compose_cmd() {
+    slug="$1"
+    shift
+
+    docker compose \
+        --project-name "secure-$slug" \
+        --file "$(app_root "$slug")/compose.yaml" \
+        "$@"
+}
+
+ensure_layout() {
+    slug="$1"
+    dir="$(app_root "$slug")"
+
+    mkdir -p \
+        "$dir/config/tls" \
+        "$dir/data/storage/app/public" \
+        "$dir/data/storage/framework/cache/data" \
+        "$dir/data/storage/framework/sessions" \
+        "$dir/data/storage/framework/views" \
+        "$dir/data/storage/logs" \
+        "$dir/data/bootstrap-cache" \
+        "$dir/data/redis" \
+        "$dir/releases"
+
+    if [ ! -f "$dir/config/tuning.cfg" ]; then
+        install -m 0644 \
+            "$SHARE/tuning.cfg" \
+            "$dir/config/tuning.cfg"
+
+        sed -i \
+            "s/^APP_SLUG=.*/APP_SLUG=$slug/" \
+            "$dir/config/tuning.cfg"
+    fi
+
+    if [ ! -f "$dir/config/.env" ]; then
+        cat > "$dir/config/.env" <<EOF_ENV
+APP_NAME="$slug"
+APP_ENV=production
+APP_KEY=
+APP_DEBUG=false
+APP_URL=https://CHANGE_ME
+
+LOG_CHANNEL=stderr
+LOG_LEVEL=warning
+
+CACHE_STORE=redis
+SESSION_DRIVER=redis
+QUEUE_CONNECTION=redis
+
+REDIS_HOST=redis
+REDIS_PORT=6379
+
+EOF_ENV
+
+        chmod 0600 "$dir/config/.env"
+    fi
+}
+
+prepare_permissions() {
+    slug="$1"
+    dir="$(app_root "$slug")"
+    cfg="$dir/config/tuning.cfg"
+
+    uid="$(cfg_get "$cfg" APP_RUNTIME_UID 10001)"
+    gid="$(cfg_get "$cfg" APP_RUNTIME_GID 10001)"
+
+    echo "$uid" | grep -Eq '^[0-9]+$' || die "invalid APP_RUNTIME_UID"
+    echo "$gid" | grep -Eq '^[0-9]+$' || die "invalid APP_RUNTIME_GID"
+
+    chown "$uid:$gid" "$dir/config/.env"
+    chmod 0600 "$dir/config/.env"
+
+    chown -R "$uid:$gid" \
+        "$dir/data/storage" \
+        "$dir/data/bootstrap-cache"
+}
+
+render_compose() {
+    slug="$1"
+
+    dir="$(app_root "$slug")"
+    cfg="$dir/config/tuning.cfg"
+
+    [ -L "$dir/current" ] || \
+        die "no current release for $slug"
+
+    [ -r "$cfg" ] || \
+        die "missing tuning.cfg for $slug"
+
+    [ -r "$dir/config/.env" ] || \
+        die "missing .env for $slug"
+
+    load_runtime
+
+    docker_cpus="$(cfg_get "$cfg" DOCKER_CPUS 0)"
+    docker_memory="$(cfg_get "$cfg" DOCKER_MEMORY 0)"
+    docker_reservation="$(cfg_get "$cfg" DOCKER_MEMORY_RESERVATION 0)"
+    docker_pids="$(cfg_get "$cfg" DOCKER_PIDS_LIMIT 4096)"
+    docker_shm="$(cfg_get "$cfg" DOCKER_SHM_SIZE 256M)"
+    redis_memory="$(cfg_get "$cfg" REDIS_DOCKER_MEMORY 768M)"
+
+    {
+        cat <<EOF_YAML
+services:
+  web:
+    image: $RUNTIME_IMAGE
+    container_name: secure-app-$slug-web
+    restart: unless-stopped
+EOF_YAML
+
+        [ "$docker_cpus" = "0" ] || \
+            echo "    cpus: \"$docker_cpus\""
+
+        [ "$docker_memory" = "0" ] || \
+            echo "    mem_limit: \"$docker_memory\""
+
+        [ "$docker_reservation" = "0" ] || \
+            echo "    mem_reservation: \"$docker_reservation\""
+
+        [ "$docker_pids" = "0" ] || \
+            echo "    pids_limit: $docker_pids"
+
+        [ "$docker_shm" = "0" ] || \
+            echo "    shm_size: \"$docker_shm\""
+
+        cat <<EOF_YAML
+    volumes:
+      - $dir/current/app:/opt/app:ro
+      - $dir/config:/run/app-config:ro
+      - $dir/data/storage:/opt/app/storage
+      - $dir/data/bootstrap-cache:/opt/app/bootstrap/cache
+    depends_on:
+      - redis
+    networks:
+      - gateway
+      - private
+
+  redis:
+    image: $REDIS_IMAGE
+    container_name: secure-app-$slug-redis
+    restart: unless-stopped
+EOF_YAML
+
+        [ "$redis_memory" = "0" ] || \
+            echo "    mem_limit: \"$redis_memory\""
+
+        cat <<EOF_YAML
+    volumes:
+      - $dir/config/tuning.cfg:/run/app-config/tuning.cfg:ro
+      - $dir/data/redis:/data
+    networks:
+      - private
+
+networks:
+  gateway:
+    external: true
+    name: $GATEWAY_NETWORK
+
+  private:
+    name: secure-app-$slug-private
+    internal: true
+EOF_YAML
+    } > "$dir/compose.yaml"
+}
+
+cert_public_hash() {
+    openssl x509 \
+        -in "$1" \
+        -pubkey \
+        -noout 2>/dev/null |
+    openssl pkey \
+        -pubin \
+        -outform DER 2>/dev/null |
+    sha256sum |
+    awk '{print $1}'
+}
+
+key_public_hash() {
+    openssl pkey \
+        -in "$1" \
+        -pubout \
+        -outform DER 2>/dev/null |
+    sha256sum |
+    awk '{print $1}'
+}
+
+register_gateway() {
+    slug="$1"
+
+    dir="$(app_root "$slug")"
+    cfg="$dir/config/tuning.cfg"
+
+    domain="$(cfg_get "$cfg" APP_DOMAIN CHANGE_ME)"
+    tls_min="$(cfg_get "$cfg" CADDY_TLS_MIN tls1.2)"
+    tls_max="$(cfg_get "$cfg" CADDY_TLS_MAX tls1.3)"
+
+    [ "$domain" != "CHANGE_ME" ] || \
+        die "set APP_DOMAIN in $cfg"
+
+    echo "$domain" | grep -Eq '^[A-Za-z0-9.-]+$' || \
+        die "invalid APP_DOMAIN: $domain"
+
+    case "$tls_min" in
+        tls1.2|tls1.3) ;;
+        *) die "invalid CADDY_TLS_MIN: $tls_min" ;;
+    esac
+
+    case "$tls_max" in
+        tls1.2|tls1.3) ;;
+        *) die "invalid CADDY_TLS_MAX: $tls_max" ;;
+    esac
+
+    cert="$dir/config/tls/ssl.crt"
+    key="$dir/config/tls/ssl.key"
+    ca="$dir/config/tls/ca.crt"
+
+    [ -r "$cert" ] || \
+        die "missing TLS certificate: $cert"
+
+    [ -r "$key" ] || \
+        die "missing TLS private key: $key"
+
+    cert_hash="$(cert_public_hash "$cert")"
+    key_hash="$(key_public_hash "$key")"
+
+    [ -n "$cert_hash" ] || \
+        die "unable to read TLS certificate"
+
+    [ "$cert_hash" = "$key_hash" ] || \
+        die "TLS certificate and private key do not match"
+
+    target_tls="$GATEWAY_DIR/tls/$slug"
+
+    mkdir -p \
+        "$GATEWAY_DIR/apps" \
+        "$target_tls"
+
+    if [ -r "$ca" ]; then
+        cat "$cert" "$ca" > "$target_tls/fullchain.pem"
+    else
+        install -m 0644 \
+            "$cert" \
+            "$target_tls/fullchain.pem"
+    fi
+
+    install -m 0600 \
+        "$key" \
+        "$target_tls/ssl.key"
+
+    fragment="$GATEWAY_DIR/apps/$slug.caddy"
+    backup="$fragment.previous"
+    temp="$fragment.new"
+
+    if [ -f "$fragment" ]; then
+        cp "$fragment" "$backup"
+    else
+        rm -f "$backup"
+    fi
+
+    cat > "$temp" <<EOF_CADDY
+https://$domain {
+    tls /etc/caddy/tls/$slug/fullchain.pem /etc/caddy/tls/$slug/ssl.key {
+        protocols $tls_min $tls_max
+    }
+
+    encode zstd gzip
+
+    reverse_proxy secure-app-$slug-web:8080
+}
+EOF_CADDY
+
+    mv "$temp" "$fragment"
+
+    if ! docker exec "$GATEWAY_CONTAINER" \
+        caddy validate \
+        --config /etc/caddy/Caddyfile \
+        --adapter caddyfile >/dev/null
+    then
+        if [ -f "$backup" ]; then
+            mv "$backup" "$fragment"
+        else
+            rm -f "$fragment"
+        fi
+
+        die "gateway Caddy validation failed"
+    fi
+
+    rm -f "$backup"
+
+    docker exec "$GATEWAY_CONTAINER" \
+        caddy reload \
+        --force \
+        --config /etc/caddy/Caddyfile \
+        --adapter caddyfile
+
+    echo "GATEWAY_DOMAIN=$domain"
+    echo "GATEWAY=APPLIED"
+}
+
+install_pack() {
+    pack="$1"
+
+    [ -r "$pack" ] || \
+        die "package not readable: $pack"
+
+    tmp="$(mktemp -d)"
+    trap 'rm -rf "$tmp"' EXIT INT TERM
+
+    tar -xf "$pack" -C "$tmp"
+
+    manifest="$tmp/manifest.env"
+
+    [ -r "$manifest" ] || \
+        die "package manifest missing"
+
+    format="$(cfg_get "$manifest" SAPP_FORMAT "")"
+    slug="$(cfg_get "$manifest" APP_SLUG "")"
+    version="$(cfg_get "$manifest" APP_VERSION "")"
+    security_mode="$(cfg_get "$manifest" SECURITY_MODE "")"
+
+    [ "$format" = "1" ] || \
+        die "unsupported SAPP_FORMAT: $format"
+
+    valid_slug "$slug" || \
+        die "invalid APP_SLUG in package: $slug"
+
+    echo "$version" | grep -Eq '^[A-Za-z0-9._-]+$' || \
+        die "invalid APP_VERSION in package: $version"
+
+    [ "$security_mode" = "TEST_PLAINTEXT" ] || \
+        die "this appctl milestone accepts TEST_PLAINTEXT packages only"
+
+    (
+        cd "$tmp"
+        sha256sum -c checksums.sha256
+    )
+
+    ensure_layout "$slug"
+
+    dir="$(app_root "$slug")"
+    release="$dir/releases/$version"
+
+    [ ! -e "$release" ] || \
+        die "release already exists: $release"
+
+    mkdir -p "$release/app"
+
+    tar \
+        -xzf "$tmp/payload/app.tar.gz" \
+        -C "$release/app"
+
+    install -m 0644 \
+        "$manifest" \
+        "$release/manifest.env"
+
+    [ -f "$release/app/artisan" ] || \
+        die "Laravel artisan missing from release"
+
+    [ -f "$release/app/public/index.php" ] || \
+        die "public/index.php missing from release"
+
+    [ -L "$release/app/.env" ] || \
+        die "release .env symlink missing"
+
+    [ "$(readlink "$release/app/.env")" = "/run/app-config/.env" ] || \
+        die "release .env symlink is invalid"
+
+    if [ -L "$dir/current" ]; then
+        old="$(readlink "$dir/current")"
+
+        ln -sfn "$old" "$dir/previous.new"
+        mv -Tf "$dir/previous.new" "$dir/previous"
+    fi
+
+    ln -sfn "releases/$version" "$dir/current.new"
+    mv -Tf "$dir/current.new" "$dir/current"
+
+    prepare_permissions "$slug"
+
+    echo
+    echo "=== APPLICATION INSTALLED ==="
+    echo "APP_SLUG=$slug"
+    echo "APP_VERSION=$version"
+    echo "SECURITY_MODE=$security_mode"
+    echo "APP_ROOT=$dir"
+    echo
+    echo "EDIT=$dir/config/.env"
+    echo "EDIT=$dir/config/tuning.cfg"
+    echo "TLS=$dir/config/tls/"
+    echo
+    echo "NEXT=sudo appctl apply $slug"
+    echo
+    echo "WARNING=TEST_PLAINTEXT package. Protected loader is not implemented yet."
+}
+
+apply_app() {
+    slug="$1"
+
+    valid_slug "$slug" || \
+        die "invalid application slug: $slug"
+
+    dir="$(app_root "$slug")"
+
+    [ -d "$dir" ] || \
+        die "application is not installed: $slug"
+
+    prepare_permissions "$slug"
+    render_compose "$slug"
+
+    compose_cmd "$slug" \
+        up -d --force-recreate
+
+    register_gateway "$slug"
+
+    echo
+    echo "APP=$slug"
+    echo "APPLY=COMPLETE"
+}
+
+rollback_app() {
+    slug="$1"
+    dir="$(app_root "$slug")"
+
+    [ -L "$dir/current" ] || \
+        die "current release missing"
+
+    [ -L "$dir/previous" ] || \
+        die "previous release missing"
+
+    current="$(readlink "$dir/current")"
+    previous="$(readlink "$dir/previous")"
+
+    ln -sfn "$previous" "$dir/current.new"
+    mv -Tf "$dir/current.new" "$dir/current"
+
+    ln -sfn "$current" "$dir/previous.new"
+    mv -Tf "$dir/previous.new" "$dir/previous"
+
+    apply_app "$slug"
+}
+
+status_app() {
+    slug="$1"
+    dir="$(app_root "$slug")"
+
+    [ -d "$dir" ] || \
+        die "application is not installed: $slug"
+
+    echo "APP=$slug"
+
+    if [ -L "$dir/current" ]; then
+        echo "CURRENT=$(readlink "$dir/current")"
+    fi
+
+    if [ -L "$dir/previous" ]; then
+        echo "PREVIOUS=$(readlink "$dir/previous")"
+    fi
+
+    compose_cmd "$slug" ps
+}
+
+list_apps() {
+    [ -d "$ROOT" ] || exit 0
+
+    for dir in "$ROOT"/*
+    do
+        [ -d "$dir" ] || continue
+
+        slug="$(basename "$dir")"
+
+        [ "$slug" = "_gateway" ] && continue
+
+        if [ -L "$dir/current" ]; then
+            printf '%s\t%s\n' \
+                "$slug" \
+                "$(readlink "$dir/current")"
+        else
+            printf '%s\t%s\n' \
+                "$slug" \
+                "NO_RELEASE"
+        fi
+    done
+}
+
+doctor() {
+    echo "=== SECURE APP DOCTOR ==="
+
+    command -v docker >/dev/null 2>&1 || \
+        die "docker command missing"
+
+    command -v openssl >/dev/null 2>&1 || \
+        die "openssl command missing"
+
+    docker info >/dev/null 2>&1 || \
+        die "Docker daemon unavailable"
+
+    docker compose version
+
+    load_runtime
+
+    docker image inspect "$RUNTIME_IMAGE" >/dev/null 2>&1 || \
+        die "runtime image missing: $RUNTIME_IMAGE"
+
+    docker image inspect "$REDIS_IMAGE" >/dev/null 2>&1 || \
+        die "Redis image missing: $REDIS_IMAGE"
+
+    docker network inspect "$GATEWAY_NETWORK" >/dev/null 2>&1 || \
+        die "gateway network missing"
+
+    docker inspect "$GATEWAY_CONTAINER" >/dev/null 2>&1 || \
+        die "gateway container missing"
+
+    echo "RUNTIME_IMAGE=$RUNTIME_IMAGE"
+    echo "REDIS_IMAGE=$REDIS_IMAGE"
+
+    sysctl vm.overcommit_memory
+    sysctl net.core.rmem_max
+    sysctl net.core.wmem_max
+
+    echo "DOCTOR=PASS"
+}
+
+usage() {
+    cat <<'EOF_USAGE'
+Usage:
+
+  appctl doctor
+  appctl list
+
+  appctl install <package.sapp>
+  appctl deploy <package.sapp>
+
+  appctl apply <app-slug>
+  appctl start <app-slug>
+  appctl stop <app-slug>
+  appctl restart <app-slug>
+
+  appctl status <app-slug>
+  appctl logs <app-slug>
+
+  appctl rollback <app-slug>
+EOF_USAGE
+
+    exit 1
+}
+
+need_root
+
+command="${1:-}"
+
+case "$command" in
+    doctor)
+        doctor
+        ;;
+
+    list)
+        list_apps
+        ;;
+
+    install|deploy)
+        [ "$#" -eq 2 ] || usage
+        install_pack "$2"
+        ;;
+
+    apply)
+        [ "$#" -eq 2 ] || usage
+        apply_app "$2"
+        ;;
+
+    start)
+        [ "$#" -eq 2 ] || usage
+        render_compose "$2"
+        prepare_permissions "$2"
+        compose_cmd "$2" up -d
+        register_gateway "$2"
+        ;;
+
+    stop)
+        [ "$#" -eq 2 ] || usage
+        compose_cmd "$2" stop
+        ;;
+
+    restart)
+        [ "$#" -eq 2 ] || usage
+        prepare_permissions "$2"
+        compose_cmd "$2" restart
+        register_gateway "$2"
+        ;;
+
+    status)
+        [ "$#" -eq 2 ] || usage
+        status_app "$2"
+        ;;
+
+    logs)
+        [ "$#" -eq 2 ] || usage
+        compose_cmd "$2" logs --tail=200
+        ;;
+
+    rollback)
+        [ "$#" -eq 2 ] || usage
+        rollback_app "$2"
+        ;;
+
+    *)
+        usage
+        ;;
+esac
