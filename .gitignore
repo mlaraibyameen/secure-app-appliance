@@ -1,0 +1,28 @@
+# Private keys and secrets
+*.key
+*.pem
+*.p12
+*.pfx
+*.agekey
+*_ed25519
+*_rsa
+.env
+.env.*
+secrets/
+private/
+
+# Build output
+dist/
+build/
+tmp/
+*.tar
+*.tar.gz
+*.tar.zst
+
+# IDE / OS
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Product recovery key intentionally version-controlled
+!keys/product_unlock_ed25519
