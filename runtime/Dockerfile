@@ -8,6 +8,8 @@ FROM caddy:${CADDY_VERSION} AS caddy-bin
 FROM php:${PHP_VERSION}-fpm-bookworm AS php-builder
 
 ARG OCI8_VERSION=3.4.1
+ARG PHPREDIS_VERSION=6.3.0
+ARG APCU_VERSION=5.1.28
 ARG ORACLE_INSTANTCLIENT_SHORT=19_32
 ARG ORACLE_BASIC_FILENAME
 ARG ORACLE_BASIC_SHA256
@@ -52,7 +54,8 @@ RUN set -eux; \
     printf 'instantclient,/opt/oracle/instantclient_%s\n' \
         "${ORACLE_INSTANTCLIENT_SHORT}" \
         | pecl install "oci8-${OCI8_VERSION}"; \
-    docker-php-ext-enable oci8; \
+    pecl install "redis-${PHPREDIS_VERSION}" "apcu-${APCU_VERSION}"; \
+    docker-php-ext-enable oci8 redis apcu; \
     echo "=== OCI8 LINK CHECK ==="; \
     ldd "$(php-config --extension-dir)/oci8.so"; \
     echo "=== ORACLE CLIENT LINK CHECK ==="; \
@@ -127,11 +130,14 @@ RUN set -eux; \
 COPY runtime/Caddyfile /etc/caddy/Caddyfile
 COPY runtime/php-fpm-www.conf /usr/local/etc/php-fpm.d/zz-secure-app.conf
 COPY runtime/entrypoint.sh /usr/local/bin/secure-app-entrypoint
+COPY runtime/apply-tuning.sh /usr/local/bin/apply-tuning
 
 COPY ${APP_SOURCE}/ ${APP_ROOT}/
 
 RUN set -eux; \
-    chmod 755 /usr/local/bin/secure-app-entrypoint; \
+    chmod 755 \
+        /usr/local/bin/secure-app-entrypoint \
+        /usr/local/bin/apply-tuning; \
     mkdir -p "${APP_ROOT}/bootstrap/cache"; \
     chown -R "${APP_RUNTIME_UID}:${APP_RUNTIME_GID}" \
         "${APP_ROOT}/storage" \
