@@ -67,16 +67,21 @@ for file in \
     AppCaddyfile \
     php-fpm-www.conf \
     shared-entrypoint.sh \
+    shared-start.sh \
+    sws-keyhold.c \
     redis-entrypoint.sh \
     apply-tuning.sh
 do
     cp "$ROOT/runtime/$file" "$STAGE/runtime/$file"
 done
 
+mkdir -p "$STAGE/runtime/sws_loader"
+cp -a "$ROOT/runtime/sws_loader/." "$STAGE/runtime/sws_loader/"
 cp -a "$ROOT/runtime/profiles/." "$STAGE/runtime/profiles/"
 
 chmod 0755 \
     "$STAGE/runtime/shared-entrypoint.sh" \
+    "$STAGE/runtime/shared-start.sh" \
     "$STAGE/runtime/redis-entrypoint.sh" \
     "$STAGE/runtime/apply-tuning.sh"
 

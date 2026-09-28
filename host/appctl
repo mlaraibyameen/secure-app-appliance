@@ -155,6 +155,7 @@ start_unlocked_apps() {
             prepare_permissions "$slug"
             render_compose "$slug"
             compose_cmd "$slug" up -d
+            unlock_web_if_needed "$slug"
             echo "STARTED_APP=$slug"
         else
             echo "START_SKIPPED=$slug"
@@ -248,6 +249,325 @@ cfg_get() {
     else
         printf '%s' "$default"
     fi
+}
+
+security_manifest_validate() {
+    sws_manifest="$1"
+    sws_slug="$2"
+    sws_version="$3"
+    sws_runtime="$4"
+
+    [ -r "$sws_manifest" ] || \
+        die "security manifest missing: $sws_manifest"
+
+    sws_mode="$(
+        cfg_get \
+            "$sws_manifest" \
+            SECURITY_MODE \
+            ""
+    )"
+
+    case "$sws_mode" in
+        TEST_PLAINTEXT)
+            return
+            ;;
+        SWS_V1)
+            ;;
+        *)
+            die "unsupported SECURITY_MODE: $sws_mode"
+            ;;
+    esac
+
+    sws_format="$(
+        cfg_get \
+            "$sws_manifest" \
+            SWS_FORMAT \
+            ""
+    )"
+
+    sws_namespace="$(
+        cfg_get \
+            "$sws_manifest" \
+            SWS_NAMESPACE \
+            ""
+    )"
+
+    sws_challenge="$(
+        cfg_get \
+            "$sws_manifest" \
+            SWS_CHALLENGE \
+            ""
+    )"
+
+    sws_fingerprint="$(
+        cfg_get \
+            "$sws_manifest" \
+            SWS_KEY_FINGERPRINT \
+            ""
+    )"
+
+    [ "$sws_format" = "1" ] || \
+        die "unsupported SWS_FORMAT: $sws_format"
+
+    [ "$sws_namespace" = "secure-app-sws" ] || \
+        die "invalid SWS_NAMESPACE: $sws_namespace"
+
+    sws_expected_challenge="secure-app-appliance:sws:v1:$sws_slug:$sws_version:$sws_runtime"
+
+    [ "$sws_challenge" = "$sws_expected_challenge" ] || \
+        die "SWS challenge does not match package metadata"
+
+    load_operator_auth
+
+    [ "$sws_fingerprint" = "$PRODUCT_KEY_FINGERPRINT" ] || \
+        die "SWS package was built for a different product key"
+}
+
+current_manifest() {
+    sws_slug="$1"
+    sws_dir="$(app_root "$sws_slug")"
+
+    printf '%s' \
+        "$sws_dir/current/manifest.env"
+}
+
+app_security_mode() {
+    sws_slug="$1"
+    sws_manifest="$(current_manifest "$sws_slug")"
+
+    [ -r "$sws_manifest" ] || \
+        die "current release manifest missing: $sws_manifest"
+
+    cfg_get \
+        "$sws_manifest" \
+        SECURITY_MODE \
+        ""
+}
+
+validate_current_release_security() {
+    sws_slug="$1"
+    sws_manifest="$(current_manifest "$sws_slug")"
+
+    [ -r "$sws_manifest" ] || \
+        die "current release manifest missing: $sws_manifest"
+
+    sws_version="$(
+        cfg_get \
+            "$sws_manifest" \
+            APP_VERSION \
+            ""
+    )"
+
+    sws_runtime="$(
+        cfg_get \
+            "$sws_manifest" \
+            RUNTIME_PROFILE \
+            ""
+    )"
+
+    security_manifest_validate \
+        "$sws_manifest" \
+        "$sws_slug" \
+        "$sws_version" \
+        "$sws_runtime"
+}
+
+derive_sws_master() {
+    sws_slug="$1"
+    sws_manifest="$(current_manifest "$sws_slug")"
+
+    validate_current_release_security \
+        "$sws_slug"
+
+    sws_mode="$(
+        cfg_get \
+            "$sws_manifest" \
+            SECURITY_MODE \
+            ""
+    )"
+
+    [ "$sws_mode" = "SWS_V1" ] || \
+        die "SWS master requested for non-protected release"
+
+    sws_namespace="$(
+        cfg_get \
+            "$sws_manifest" \
+            SWS_NAMESPACE \
+            ""
+    )"
+
+    sws_challenge_text="$(
+        cfg_get \
+            "$sws_manifest" \
+            SWS_CHALLENGE \
+            ""
+    )"
+
+    install -d \
+        -m 0700 \
+        /run/secure-app-appliance/sws
+
+    sws_tmp="$(
+        mktemp \
+            -d \
+            /run/secure-app-appliance/sws/sign.XXXXXX
+    )"
+
+    sws_challenge_file="$sws_tmp/challenge"
+    sws_signature="$sws_challenge_file.sig"
+
+    printf '%s\n' \
+        "$sws_challenge_text" \
+        > "$sws_challenge_file"
+
+    chmod 0600 \
+        "$sws_challenge_file"
+
+    if ! ssh-keygen \
+        -Y sign \
+        -q \
+        -f "$PRODUCT_PUBLIC_KEY" \
+        -n "$sws_namespace" \
+        "$sws_challenge_file" \
+        >/dev/null 2>&1
+    then
+        rm -rf "$sws_tmp"
+        die "unable to sign SWS release challenge with forwarded product key"
+    fi
+
+    if ! ssh-keygen \
+        -Y verify \
+        -q \
+        -f "$PRODUCT_ALLOWED_SIGNERS" \
+        -I secure-app-product \
+        -n "$sws_namespace" \
+        -s "$sws_signature" \
+        < "$sws_challenge_file" \
+        >/dev/null 2>&1
+    then
+        rm -rf "$sws_tmp"
+        die "SWS release challenge signature verification failed"
+    fi
+
+    sws_master="$(
+        openssl dgst \
+            -sha512 \
+            "$sws_signature" |
+        awk '{print $NF}'
+    )"
+
+    rm -rf "$sws_tmp"
+
+    echo "$sws_master" | \
+        grep -Eq '^[0-9a-fA-F]{128}$' || \
+        die "invalid SWS master derivation"
+
+    printf '%s' \
+        "$sws_master"
+}
+
+unlock_web_if_needed() {
+    unlock_slug="$1"
+    unlock_mode="$(
+        app_security_mode \
+            "$unlock_slug"
+    )"
+
+    case "$unlock_mode" in
+        TEST_PLAINTEXT)
+            return
+            ;;
+        SWS_V1)
+            ;;
+        *)
+            die "unsupported application security mode: $unlock_mode"
+            ;;
+    esac
+
+    unlock_container="secure-app-$unlock_slug-web"
+
+    [ "$(
+        docker inspect \
+            -f '{{.State.Running}}' \
+            "$unlock_container" \
+            2>/dev/null || true
+    )" = "true" ] || \
+        die "protected web container is not running: $unlock_container"
+
+    if docker exec \
+        "$unlock_container" \
+        sh -c \
+        'test -f /run/secure-app/sws-active' \
+        >/dev/null 2>&1
+    then
+        echo "SWS_UNLOCK=ALREADY_ACTIVE"
+        return
+    fi
+
+    unlock_master="$(
+        derive_sws_master \
+            "$unlock_slug"
+    )"
+
+    if ! printf '%s\n' "$unlock_master" | \
+        docker exec \
+            -i \
+            "$unlock_container" \
+            sh -c '
+                i=0
+                while [ ! -p /run/secure-app/sws-unlock ]
+                do
+                    i=$((i + 1))
+                    [ "$i" -lt 200 ] || exit 10
+                    sleep 0.05
+                done
+
+                cat > /run/secure-app/sws-unlock
+            '
+    then
+        unlock_master=""
+        die "failed to deliver SWS unlock material to protected container"
+    fi
+
+    unlock_master=""
+
+    unlock_wait=0
+
+    while ! docker exec \
+        "$unlock_container" \
+        sh -c \
+        'test -f /run/secure-app/sws-active' \
+        >/dev/null 2>&1
+    do
+        unlock_wait=$((unlock_wait + 1))
+
+        if [ "$unlock_wait" -ge 100 ]; then
+            docker logs \
+                --tail 100 \
+                "$unlock_container" \
+                >&2 || true
+
+            die "protected runtime did not confirm SWS unlock"
+        fi
+
+        if [ "$(
+            docker inspect \
+                -f '{{.State.Running}}' \
+                "$unlock_container" \
+                2>/dev/null || true
+        )" != "true" ]; then
+            docker logs \
+                --tail 100 \
+                "$unlock_container" \
+                >&2 || true
+
+            die "protected runtime stopped during SWS unlock"
+        fi
+
+        sleep 0.1
+    done
+
+    echo "SWS_UNLOCK=PASS"
 }
 
 load_runtime() {
@@ -579,6 +899,7 @@ EOF_YAML
         cat <<EOF_YAML
     volumes:
       - $dir/current/app:/opt/app:ro
+      - $dir/current/manifest.env:/run/app-manifest/manifest.env:ro
       - $dir/config:/run/app-config:ro
       - $dir/data/storage:/opt/app/storage
       - $dir/data/bootstrap-cache:/opt/app/bootstrap/cache
@@ -886,6 +1207,7 @@ preflight_app() {
     profile="$(app_runtime_profile "$slug")"
 
     validate_runtime_profile "$profile"
+    validate_current_release_security "$slug"
 
     echo "APP=$slug"
     echo "CURRENT_RELEASE=$(readlink "$dir/current")"
@@ -1050,8 +1372,11 @@ install_pack() {
     echo "$version" | grep -Eq '^[A-Za-z0-9._-]+$' || \
         die "invalid APP_VERSION in package: $version"
 
-    [ "$security_mode" = "TEST_PLAINTEXT" ] || \
-        die "this appctl milestone accepts TEST_PLAINTEXT packages only"
+    security_manifest_validate \
+        "$manifest" \
+        "$slug" \
+        "$version" \
+        "$runtime_profile"
 
     (
         cd "$tmp"
@@ -1113,8 +1438,14 @@ install_pack() {
     echo "TLS=$dir/config/tls/"
     echo
     echo "NEXT=sudo appctl apply $slug"
-    echo
-    echo "WARNING=TEST_PLAINTEXT package. Protected loader is not implemented yet."
+
+    if [ "$security_mode" = "TEST_PLAINTEXT" ]; then
+        echo
+        echo "WARNING=TEST_PLAINTEXT package"
+    else
+        echo
+        echo "SWS_PROTECTED=YES"
+    fi
 }
 
 apply_app() {
@@ -1144,6 +1475,8 @@ apply_app() {
         compose_cmd "$slug" \
             up -d
     fi
+
+    unlock_web_if_needed "$slug"
 
     if [ "$PLAN_GATEWAY_RELOAD" = "YES" ]; then
         register_gateway "$slug"
@@ -1899,6 +2232,7 @@ manage_app_menu() {
                 prepare_permissions "$slug"
                 render_compose "$slug"
                 compose_cmd "$slug" up -d
+                unlock_web_if_needed "$slug"
                 register_gateway "$slug"
                 write_applied_state "$slug"
                 pause_console
@@ -2129,6 +2463,7 @@ case "$command" in
         render_compose "$2"
         prepare_permissions "$2"
         compose_cmd "$2" up -d
+        unlock_web_if_needed "$2"
         register_gateway "$2"
         ;;
 
@@ -2141,6 +2476,7 @@ case "$command" in
         [ "$#" -eq 2 ] || usage
         prepare_permissions "$2"
         compose_cmd "$2" restart
+        unlock_web_if_needed "$2"
         register_gateway "$2"
         ;;
 

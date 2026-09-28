@@ -17,6 +17,9 @@ ARG ORACLE_SDK_SHA256
 
 ARG ORACLE_DOWNLOAD_BASE=https://download.oracle.com/otn_software/linux/instantclient/1932000
 
+COPY runtime/sws_loader /usr/src/sws_loader
+COPY runtime/sws-keyhold.c /usr/src/sws-keyhold.c
+
 RUN set -eux; \
     apt-get update; \
     apt-get install -y --no-install-recommends \
@@ -29,6 +32,7 @@ RUN set -eux; \
         libjpeg62-turbo-dev \
         libpng-dev \
         libzip-dev \
+        libssl-dev \
         $PHPIZE_DEPS; \
     rm -rf /var/lib/apt/lists/*; \
     curl -fL --retry 3 \
@@ -55,6 +59,14 @@ RUN set -eux; \
         | pecl install "oci8-${OCI8_VERSION}"; \
     pecl install "redis-${PHPREDIS_VERSION}" "apcu-${APCU_VERSION}"; \
     docker-php-ext-enable oci8 redis apcu; \
+    cd /usr/src/sws_loader; \
+    phpize; \
+    ./configure --enable-sws-loader; \
+    make -j"$(nproc)"; \
+    make install; \
+    cc -O2 -s \
+        -o /usr/local/bin/sws-keyhold \
+        /usr/src/sws-keyhold.c; \
     echo "=== OCI8 LINK CHECK ==="; \
     ldd "$(php-config --extension-dir)/oci8.so"; \
     echo "=== ORACLE CLIENT LINK CHECK ==="; \
@@ -77,6 +89,7 @@ ENV APP_ROOT=/opt/app \
     LD_LIBRARY_PATH=/opt/oracle/instantclient_${ORACLE_INSTANTCLIENT_SHORT}
 
 COPY --from=caddy-bin /usr/bin/caddy /usr/local/bin/caddy
+COPY --from=php-builder /usr/local/bin/sws-keyhold /usr/local/bin/sws-keyhold
 
 COPY --from=php-builder \
     /opt/oracle/instantclient_${ORACLE_INSTANTCLIENT_SHORT} \
@@ -101,6 +114,7 @@ RUN set -eux; \
         libjpeg62-turbo \
         libpng16-16 \
         libzip4 \
+        libssl3 \
         tini; \
     rm -rf /var/lib/apt/lists/*; \
     printf '%s\n' \
@@ -128,12 +142,14 @@ RUN set -eux; \
 COPY runtime/AppCaddyfile /etc/caddy/Caddyfile
 COPY runtime/php-fpm-www.conf /usr/local/etc/php-fpm.d/zz-secure-app.conf
 COPY runtime/shared-entrypoint.sh /usr/local/bin/secure-app-entrypoint
+COPY runtime/shared-start.sh /usr/local/bin/secure-app-start
 COPY runtime/apply-tuning.sh /usr/local/bin/apply-tuning
-
 
 RUN set -eux; \
     chmod 755 \
         /usr/local/bin/secure-app-entrypoint \
+        /usr/local/bin/secure-app-start \
+        /usr/local/bin/sws-keyhold \
         /usr/local/bin/apply-tuning
 
 WORKDIR ${APP_ROOT}

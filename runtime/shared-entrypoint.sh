@@ -3,6 +3,44 @@ set -eu
 
 APP_ROOT="${APP_ROOT:-/opt/app}"
 CONFIG_ROOT="${APP_CONFIG_ROOT:-/run/app-config}"
+MANIFEST="${APP_MANIFEST:-/run/app-manifest/manifest.env}"
+UNLOCK_FIFO="/run/secure-app/sws-unlock"
+
+cfg_get() {
+    file="$1"
+    key="$2"
+    default="$3"
+
+    value="$(
+        awk -v key="$key" '
+            /^[[:space:]]*#/ { next }
+            /^[[:space:]]*$/ { next }
+
+            {
+                line=$0
+                sub(/^[[:space:]]*/, "", line)
+
+                split(line, a, "=")
+                k=a[1]
+                gsub(/[[:space:]]/, "", k)
+
+                if (k == key) {
+                    sub(/^[^=]*=/, "", line)
+                    sub(/^[[:space:]]*/, "", line)
+                    sub(/[[:space:]]*$/, "", line)
+                    print line
+                    exit
+                }
+            }
+        ' "$file"
+    )"
+
+    if [ -n "$value" ]; then
+        printf '%s' "$value"
+    else
+        printf '%s' "$default"
+    fi
+}
 
 echo "=== SECURE APP RUNTIME STARTUP ==="
 
@@ -18,26 +56,38 @@ do
     fi
 done
 
-/usr/local/bin/apply-tuning
+SECURITY_MODE="TEST_PLAINTEXT"
 
-mkdir -p \
-    "$APP_ROOT/storage/app/public" \
-    "$APP_ROOT/storage/framework/cache/data" \
-    "$APP_ROOT/storage/framework/sessions" \
-    "$APP_ROOT/storage/framework/views" \
-    "$APP_ROOT/storage/logs" \
-    "$APP_ROOT/bootstrap/cache"
+if [ -r "$MANIFEST" ]; then
+    SECURITY_MODE="$(
+        cfg_get \
+            "$MANIFEST" \
+            SECURITY_MODE \
+            TEST_PLAINTEXT
+    )"
+fi
 
-chown -R app:app \
-    "$APP_ROOT/storage" \
-    "$APP_ROOT/bootstrap/cache"
+case "$SECURITY_MODE" in
+    TEST_PLAINTEXT)
+        exec /usr/local/bin/secure-app-start
+        ;;
+    SWS_V1)
+        mkdir -p /run/secure-app
+        chmod 0700 /run/secure-app
+        rm -f             "$UNLOCK_FIFO"             /run/secure-app/sws-active
 
-php-fpm -t
-echo "PHP_FPM_CONFIG=VALID"
+        mkfifo -m 0600 "$UNLOCK_FIFO"
 
-php-fpm -D
-echo "PHP_FPM=STARTED"
+        echo "SWS_STATE=LOCKED"
+        echo "SWS_UNLOCK_FIFO=$UNLOCK_FIFO"
 
-exec caddy run \
-    --config /etc/caddy/Caddyfile \
-    --adapter caddyfile
+        exec \
+            /usr/local/bin/sws-keyhold \
+            /usr/local/bin/secure-app-start \
+            < "$UNLOCK_FIFO"
+        ;;
+    *)
+        echo "ERROR: unsupported SECURITY_MODE: $SECURITY_MODE" >&2
+        exit 1
+        ;;
+esac

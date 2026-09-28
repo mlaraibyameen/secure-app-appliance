@@ -4,17 +4,26 @@ set -eu
 usage() {
     cat <<'USAGE'
 Usage:
+  ./builder/secure-build --protected <app-path> <app-slug> <version>
   ./builder/secure-build --test <app-path> <app-slug> <version>
 
-Current mode:
-  --test creates a TEST_PLAINTEXT package for deployment testing.
-
-The final encrypted SWS/protected-loader format will replace this payload later.
+Environment:
+  RUNTIME_PROFILE=php84
+  SWS_SIGNING_KEY=/path/to/product-private-key
 USAGE
     exit 1
 }
 
-[ "${1:-}" = "--test" ] || usage
+MODE="${1:-}"
+
+case "$MODE" in
+    --protected|--test)
+        ;;
+    *)
+        usage
+        ;;
+esac
+
 [ "$#" -eq 4 ] || usage
 
 APP_PATH="$(realpath "$2")"
@@ -54,6 +63,36 @@ RUNTIME_PROFILE="${RUNTIME_PROFILE:-php84}"
     echo "ERROR: unsupported runtime profile: $RUNTIME_PROFILE" >&2
     exit 1
 }
+
+SWS_SIGNING_KEY="${SWS_SIGNING_KEY:-$ROOT/keys/product_unlock_ed25519}"
+PRODUCT_PUBLIC_KEY="$ROOT/keys/product_unlock_ed25519.pub"
+
+if [ "$MODE" = "--protected" ]; then
+    [ -r "$SWS_SIGNING_KEY" ] || {
+        echo "ERROR: SWS signing key not readable: $SWS_SIGNING_KEY" >&2
+        exit 1
+    }
+
+    [ -r "$PRODUCT_PUBLIC_KEY" ] || {
+        echo "ERROR: product public key not readable: $PRODUCT_PUBLIC_KEY" >&2
+        exit 1
+    }
+
+    command -v ssh-keygen >/dev/null 2>&1 || {
+        echo "ERROR: ssh-keygen missing" >&2
+        exit 1
+    }
+
+    command -v openssl >/dev/null 2>&1 || {
+        echo "ERROR: openssl missing" >&2
+        exit 1
+    }
+
+    command -v python3 >/dev/null 2>&1 || {
+        echo "ERROR: python3 missing" >&2
+        exit 1
+    }
+fi
 
 WORK="$ROOT/build/packs/$APP_SLUG/$APP_VERSION"
 STAGE="$WORK/app"
@@ -128,6 +167,36 @@ else
     echo "FORBIDDEN_FILE_INCLUDED=NO"
 fi
 
+SECURITY_MODE="TEST_PLAINTEXT"
+SWS_FORMAT=""
+SWS_NAMESPACE=""
+SWS_CHALLENGE=""
+SWS_KEY_FINGERPRINT=""
+
+if [ "$MODE" = "--protected" ]; then
+    echo
+    echo "=== SWS SOURCE PROTECTION ==="
+
+    python3 \
+        "$ROOT/builder/sws-protect.py" \
+        "$STAGE" \
+        "$SWS_SIGNING_KEY" \
+        "$APP_SLUG" \
+        "$APP_VERSION" \
+        "$RUNTIME_PROFILE"
+
+    SECURITY_MODE="SWS_V1"
+    SWS_FORMAT="1"
+    SWS_NAMESPACE="secure-app-sws"
+    SWS_CHALLENGE="secure-app-appliance:sws:v1:$APP_SLUG:$APP_VERSION:$RUNTIME_PROFILE"
+    SWS_KEY_FINGERPRINT="$(
+        ssh-keygen \
+            -lf "$PRODUCT_PUBLIC_KEY" \
+            -E sha256 |
+        awk '{print $2}'
+    )"
+fi
+
 echo
 echo "==> Creating application payload"
 
@@ -141,7 +210,11 @@ SAPP_FORMAT=1
 APP_SLUG=$APP_SLUG
 APP_VERSION=$APP_VERSION
 RUNTIME_PROFILE=$RUNTIME_PROFILE
-SECURITY_MODE=TEST_PLAINTEXT
+SECURITY_MODE=$SECURITY_MODE
+SWS_FORMAT=$SWS_FORMAT
+SWS_NAMESPACE=$SWS_NAMESPACE
+SWS_CHALLENGE=$SWS_CHALLENGE
+SWS_KEY_FINGERPRINT=$SWS_KEY_FINGERPRINT
 BUILT_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 EOF_MANIFEST
 
@@ -164,11 +237,22 @@ echo "=== PACKAGE BUILT ==="
 echo "APP_SLUG=$APP_SLUG"
 echo "APP_VERSION=$APP_VERSION"
 echo "RUNTIME_PROFILE=$RUNTIME_PROFILE"
-echo "SECURITY_MODE=TEST_PLAINTEXT"
+echo "SECURITY_MODE=$SECURITY_MODE"
+
+if [ "$SECURITY_MODE" = "SWS_V1" ]; then
+    echo "SWS_FORMAT=$SWS_FORMAT"
+    echo "SWS_NAMESPACE=$SWS_NAMESPACE"
+    echo "SWS_CHALLENGE=$SWS_CHALLENGE"
+    echo "SWS_KEY_FINGERPRINT=$SWS_KEY_FINGERPRINT"
+fi
+
 echo "OUTPUT=$OUTPUT"
 sha256sum "$OUTPUT"
 
-echo
-echo "WARNING:"
-echo "This package is for deployment-plumbing testing only."
-echo "It is NOT the final protected source-code format."
+if [ "$MODE" = "--protected" ]; then
+    rm -rf "$WORK"
+    echo "PLAINTEXT_BUILD_STAGE=REMOVED"
+else
+    echo
+    echo "WARNING=TEST_PLAINTEXT package"
+fi
