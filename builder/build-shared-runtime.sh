@@ -8,11 +8,30 @@ set -a
 . "$ROOT/installer/versions.env"
 set +a
 
-RUNTIME_IMAGE="secure-app-runtime:$SECURE_RUNTIME_VERSION"
+PROFILE="${1:-$DEFAULT_RUNTIME_PROFILE}"
+PROFILE_FILE="$ROOT/runtime/profiles/$PROFILE.env"
+
+[ -r "$PROFILE_FILE" ] || {
+    echo "ERROR: runtime profile not found: $PROFILE" >&2
+    exit 1
+}
+
+set -a
+. "$PROFILE_FILE"
+set +a
+
+[ "$PROFILE" = "$RUNTIME_PROFILE" ] || {
+    echo "ERROR: runtime profile mismatch: $PROFILE" >&2
+    exit 1
+}
+
+RUNTIME_IMAGE="secure-app-runtime:${RUNTIME_PROFILE}-${SECURE_RUNTIME_VERSION}"
 REDIS_IMAGE="secure-app-redis:$SECURE_RUNTIME_VERSION"
 GATEWAY_IMAGE="public.ecr.aws/docker/library/caddy:$CADDY_VERSION"
 
-echo "=== BUILD SHARED RUNTIME ==="
+echo "=== BUILD RUNTIME PROFILE ==="
+echo "RUNTIME_PROFILE=$RUNTIME_PROFILE"
+echo "PHP_VERSION=$PHP_VERSION"
 echo "RUNTIME_IMAGE=$RUNTIME_IMAGE"
 echo "REDIS_IMAGE=$REDIS_IMAGE"
 echo "GATEWAY_IMAGE=$GATEWAY_IMAGE"
@@ -37,11 +56,13 @@ docker build \
     -f "$ROOT/runtime/shared.Dockerfile" \
     "$ROOT"
 
-docker build \
-    --build-arg REDIS_SERVER_VERSION="$REDIS_SERVER_VERSION" \
-    -t "$REDIS_IMAGE" \
-    -f "$ROOT/runtime/redis.Dockerfile" \
-    "$ROOT"
+if ! docker image inspect "$REDIS_IMAGE" >/dev/null 2>&1; then
+    docker build \
+        --build-arg REDIS_SERVER_VERSION="$REDIS_SERVER_VERSION" \
+        -t "$REDIS_IMAGE" \
+        -f "$ROOT/runtime/redis.Dockerfile" \
+        "$ROOT"
+fi
 
 docker pull "$GATEWAY_IMAGE"
 
@@ -77,6 +98,8 @@ if (file_exists("/opt/app/artisan")) {
     exit(1);
 }
 
+echo "PHP_VERSION=" . PHP_VERSION . PHP_EOL;
+echo "OCI8_VERSION=" . phpversion("oci8") . PHP_EOL;
 echo "APP_SOURCE_PRESENT=NO" . PHP_EOL;
 echo "PHP_RUNTIME=PASS" . PHP_EOL;
 '
@@ -91,7 +114,8 @@ docker run \
     --version
 
 echo
+echo "RUNTIME_PROFILE=$RUNTIME_PROFILE"
 echo "RUNTIME_IMAGE=$RUNTIME_IMAGE"
 echo "REDIS_IMAGE=$REDIS_IMAGE"
 echo "GATEWAY_IMAGE=$GATEWAY_IMAGE"
-echo "SHARED_RUNTIME_BUILD=PASS"
+echo "RUNTIME_PROFILE_BUILD=PASS"

@@ -48,6 +48,13 @@ echo "$APP_VERSION" | grep -Eq '^[A-Za-z0-9._-]+$' || {
 
 ROOT="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
 
+RUNTIME_PROFILE="${RUNTIME_PROFILE:-php84}"
+
+[ -r "$ROOT/runtime/profiles/$RUNTIME_PROFILE.env" ] || {
+    echo "ERROR: unsupported runtime profile: $RUNTIME_PROFILE" >&2
+    exit 1
+}
+
 WORK="$ROOT/build/packs/$APP_SLUG/$APP_VERSION"
 STAGE="$WORK/app"
 PACKAGE="$WORK/package"
@@ -133,6 +140,7 @@ cat > "$PACKAGE/manifest.env" <<EOF_MANIFEST
 SAPP_FORMAT=1
 APP_SLUG=$APP_SLUG
 APP_VERSION=$APP_VERSION
+RUNTIME_PROFILE=$RUNTIME_PROFILE
 SECURITY_MODE=TEST_PLAINTEXT
 BUILT_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 EOF_MANIFEST
@@ -155,6 +163,7 @@ echo
 echo "=== PACKAGE BUILT ==="
 echo "APP_SLUG=$APP_SLUG"
 echo "APP_VERSION=$APP_VERSION"
+echo "RUNTIME_PROFILE=$RUNTIME_PROFILE"
 echo "SECURITY_MODE=TEST_PLAINTEXT"
 echo "OUTPUT=$OUTPUT"
 sha256sum "$OUTPUT"

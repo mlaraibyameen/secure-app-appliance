@@ -18,6 +18,8 @@ mkdir -p \
     "$STAGE/installer" \
     "$STAGE/builder" \
     "$STAGE/runtime" \
+    "$STAGE/runtime/profiles" \
+    "$STAGE/keys" \
     "$STAGE/host/templates" \
     "$STAGE/gateway" \
     "$DIST"
@@ -29,6 +31,10 @@ install -m 0755 \
 install -m 0644 \
     "$ROOT/installer/versions.env" \
     "$STAGE/installer/versions.env"
+
+install -m 0644 \
+    "$ROOT/keys/product_unlock_ed25519.pub" \
+    "$STAGE/keys/product_unlock_ed25519.pub"
 
 install -m 0755 \
     "$ROOT/builder/build-shared-runtime.sh" \
@@ -66,6 +72,8 @@ for file in \
 do
     cp "$ROOT/runtime/$file" "$STAGE/runtime/$file"
 done
+
+cp -a "$ROOT/runtime/profiles/." "$STAGE/runtime/profiles/"
 
 chmod 0755 \
     "$STAGE/runtime/shared-entrypoint.sh" \

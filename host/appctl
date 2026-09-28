@@ -4,6 +4,11 @@ set -eu
 ROOT="${SECURE_APP_ROOT:-/srv/secure-apps}"
 SHARE="${SECURE_APP_SHARE:-/usr/share/secure-app-appliance}"
 RUNTIME_ENV="${SECURE_APP_RUNTIME_ENV:-/etc/secure-app-appliance/runtime.env}"
+OPERATOR_ENV="/etc/secure-app-appliance/operator.env"
+PRODUCT_PUBLIC_KEY="/etc/secure-app-appliance/product_unlock_ed25519.pub"
+PRODUCT_ALLOWED_SIGNERS="/etc/secure-app-appliance/allowed_signers"
+INSTALL_MARKER="/run/secure-app-appliance/installing"
+UNLOCK_MARKER="/run/secure-app-appliance/unlocked"
 
 GATEWAY_DIR="$ROOT/_gateway"
 GATEWAY_CONTAINER="secure-app-gateway"
@@ -15,7 +20,194 @@ die() {
 }
 
 need_root() {
-    [ "$(id -u)" -eq 0 ] || die "run appctl as root"
+    if [ "$(id -u)" -eq 0 ]; then
+        return
+    fi
+
+    command -v sudo >/dev/null 2>&1 || \
+        die "sudo is required"
+
+    exec sudo /usr/local/bin/appctl "$@"
+}
+
+load_operator_auth() {
+    [ -r "$OPERATOR_ENV" ] || \
+        die "operator configuration missing"
+
+    [ -r "$PRODUCT_PUBLIC_KEY" ] || \
+        die "product public key missing"
+
+    [ -r "$PRODUCT_ALLOWED_SIGNERS" ] || \
+        die "product allowed-signers file missing"
+
+    . "$OPERATOR_ENV"
+
+    : "${OPERATOR_USER:?OPERATOR_USER missing}"
+    : "${PRODUCT_KEY_FINGERPRINT:?PRODUCT_KEY_FINGERPRINT missing}"
+}
+
+verify_product_session() {
+    load_operator_auth
+
+    session_user="${SUDO_USER:-$(id -un)}"
+
+    [ "$session_user" = "$OPERATOR_USER" ] || \
+        die "appctl is restricted to operator: $OPERATOR_USER"
+
+    [ -n "${SSH_CONNECTION:-}" ] || \
+        die "appctl requires an SSH session"
+
+    [ -n "${SSH_USER_AUTH:-}" ] || \
+        die "SSH authentication information is unavailable"
+
+    [ -r "$SSH_USER_AUTH" ] || \
+        die "SSH authentication information is unreadable"
+
+    expected_blob="$(
+        awk '{print $2}' "$PRODUCT_PUBLIC_KEY"
+    )"
+
+    awk \
+        -v blob="$expected_blob" \
+        '$1 ~ /^publickey/ && $3 == blob { found=1 } END { exit !found }' \
+        "$SSH_USER_AUTH" || \
+        die "SSH session was not authenticated with the product key"
+
+    actual_fingerprint="$(
+        ssh-keygen \
+            -lf "$PRODUCT_PUBLIC_KEY" \
+            -E sha256 |
+        awk '{print $2}'
+    )"
+
+    [ "$actual_fingerprint" = "$PRODUCT_KEY_FINGERPRINT" ] || \
+        die "installed product key fingerprint mismatch"
+
+    [ -n "${SSH_AUTH_SOCK:-}" ] || \
+        die "SSH agent forwarding is required"
+
+    [ -S "$SSH_AUTH_SOCK" ] || \
+        die "forwarded SSH agent socket is unavailable"
+
+    tmpdir="$(mktemp -d)"
+    challenge="$tmpdir/challenge"
+    signature="$challenge.sig"
+
+    {
+        printf '%s\n' "secure-app-appliance"
+        printf '%s\n' "$PRODUCT_KEY_FINGERPRINT"
+        printf '%s\n' "$SSH_CONNECTION"
+        openssl rand -hex 32
+    } > "$challenge"
+
+    if ! ssh-keygen \
+        -Y sign \
+        -q \
+        -f "$PRODUCT_PUBLIC_KEY" \
+        -n secure-app-appliance@local \
+        "$challenge" \
+        >/dev/null 2>&1
+    then
+        rm -rf "$tmpdir"
+        die "product private key is not available through the forwarded SSH agent"
+    fi
+
+    if ! ssh-keygen \
+        -Y verify \
+        -q \
+        -f "$PRODUCT_ALLOWED_SIGNERS" \
+        -I secure-app-product \
+        -n secure-app-appliance@local \
+        -s "$signature" \
+        < "$challenge" \
+        >/dev/null 2>&1
+    then
+        rm -rf "$tmpdir"
+        die "product private-key challenge verification failed"
+    fi
+
+    rm -rf "$tmpdir"
+
+    echo "PRODUCT_AUTH=PASS"
+    echo "PRODUCT_KEY_FINGERPRINT=$PRODUCT_KEY_FINGERPRINT"
+}
+
+appliance_is_unlocked() {
+    [ -f "$UNLOCK_MARKER" ]
+}
+
+start_unlocked_apps() {
+    [ -d "$ROOT" ] || return
+
+    for dir in "$ROOT"/*
+    do
+        [ -d "$dir" ] || continue
+
+        slug="$(basename "$dir")"
+
+        [ "$slug" = "_gateway" ] && continue
+        [ -r "$dir/state/applied.env" ] || continue
+        [ -L "$dir/current" ] || continue
+
+        echo "STARTING_APP=$slug"
+
+        if preflight_app "$slug" >/dev/null 2>&1; then
+            prepare_permissions "$slug"
+            render_compose "$slug"
+            compose_cmd "$slug" up -d
+            echo "STARTED_APP=$slug"
+        else
+            echo "START_SKIPPED=$slug"
+            echo "REASON=PREFLIGHT_FAILED"
+        fi
+    done
+}
+
+unlock_appliance() {
+    install -d -m 0700 /run/secure-app-appliance
+
+    if appliance_is_unlocked; then
+        echo "APPLIANCE=UNLOCKED"
+        return
+    fi
+
+    : > "$UNLOCK_MARKER"
+    chmod 0600 "$UNLOCK_MARKER"
+
+    echo "APPLIANCE=UNLOCKED"
+    echo "UNLOCK_SOURCE=PRODUCT_KEY"
+
+    start_unlocked_apps
+}
+
+lock_appliance() {
+    [ -d "$ROOT" ] || {
+        rm -f "$UNLOCK_MARKER"
+        echo "APPLIANCE=LOCKED"
+        return
+    }
+
+    for dir in "$ROOT"/*
+    do
+        [ -d "$dir" ] || continue
+
+        slug="$(basename "$dir")"
+
+        [ "$slug" = "_gateway" ] && continue
+        [ -f "$dir/compose.yaml" ] || continue
+
+        echo "STOPPING_APP=$slug"
+
+        compose_cmd "$slug" stop >/dev/null 2>&1 || true
+    done
+
+    rm -f "$UNLOCK_MARKER"
+
+    echo "APPLIANCE=LOCKED"
+}
+
+require_unlocked() {
+    appliance_is_unlocked ||         die "appliance is locked"
 }
 
 valid_slug() {
@@ -64,12 +256,167 @@ load_runtime() {
 
     . "$RUNTIME_ENV"
 
-    : "${RUNTIME_IMAGE:?RUNTIME_IMAGE missing}"
+    : "${DEFAULT_RUNTIME_PROFILE:?DEFAULT_RUNTIME_PROFILE missing}"
+    : "${RUNTIME_IMAGE_PREFIX:?RUNTIME_IMAGE_PREFIX missing}"
+    : "${RUNTIME_VERSION:?RUNTIME_VERSION missing}"
     : "${REDIS_IMAGE:?REDIS_IMAGE missing}"
+}
+
+runtime_image_for_profile() {
+    profile="$1"
+    printf '%s:%s-%s' \
+        "$RUNTIME_IMAGE_PREFIX" \
+        "$profile" \
+        "$RUNTIME_VERSION"
+}
+
+validate_runtime_profile() {
+    profile="$1"
+
+    echo "$profile" | grep -Eq '^php[0-9][0-9]$' || \
+        die "invalid runtime profile: $profile"
+
+    [ -r "$SHARE/runtime/profiles/$profile.env" ] || \
+        die "runtime profile is not available: $profile"
+}
+
+ensure_runtime_profile() {
+    profile="$1"
+
+    validate_runtime_profile "$profile"
+
+    image="$(runtime_image_for_profile "$profile")"
+
+    if docker image inspect "$image" >/dev/null 2>&1; then
+        return
+    fi
+
+    echo "RUNTIME_PROFILE=$profile"
+    echo "RUNTIME_IMAGE=$image"
+    echo "RUNTIME_STATUS=BUILD_REQUIRED"
+
+    "$SHARE/builder/build-shared-runtime.sh" "$profile"
+
+    docker image inspect "$image" >/dev/null 2>&1 || \
+        die "runtime build did not create image: $image"
 }
 
 app_root() {
     printf '%s/%s' "$ROOT" "$1"
+}
+
+app_runtime_profile() {
+    slug="$1"
+    dir="$(app_root "$slug")"
+    runtime_cfg="$dir/config/runtime.cfg"
+
+    load_runtime
+
+    if [ -r "$runtime_cfg" ]; then
+        cfg_get "$runtime_cfg" RUNTIME_PROFILE "$DEFAULT_RUNTIME_PROFILE"
+    else
+        printf '%s' "$DEFAULT_RUNTIME_PROFILE"
+    fi
+}
+
+write_runtime_profile() {
+    slug="$1"
+    profile="$2"
+    dir="$(app_root "$slug")"
+    runtime_cfg="$dir/config/runtime.cfg"
+    temp="$runtime_cfg.new"
+
+    validate_runtime_profile "$profile"
+
+    printf 'RUNTIME_PROFILE=%s\n' "$profile" > "$temp"
+    chmod 0644 "$temp"
+    mv "$temp" "$runtime_cfg"
+}
+
+list_runtime_profiles() {
+    load_runtime
+
+    for file in "$SHARE"/runtime/profiles/*.env
+    do
+        [ -r "$file" ] || continue
+
+        profile="$(cfg_get "$file" RUNTIME_PROFILE "")"
+        php_version="$(cfg_get "$file" PHP_VERSION "")"
+
+        [ -n "$profile" ] || continue
+
+        image="$(runtime_image_for_profile "$profile")"
+
+        if docker image inspect "$image" >/dev/null 2>&1; then
+            state="INSTALLED"
+        else
+            state="NOT_INSTALLED"
+        fi
+
+        printf '%s\tPHP=%s\t%s\t%s\n'             "$profile"             "$php_version"             "$state"             "$image"
+    done
+}
+
+runtime_status_app() {
+    slug="$1"
+    dir="$(app_root "$slug")"
+
+    [ -d "$dir" ] ||         die "application is not installed: $slug"
+
+    profile="$(app_runtime_profile "$slug")"
+
+    validate_runtime_profile "$profile"
+
+    file="$SHARE/runtime/profiles/$profile.env"
+    php_version="$(cfg_get "$file" PHP_VERSION "")"
+    image="$(runtime_image_for_profile "$profile")"
+
+    if docker image inspect "$image" >/dev/null 2>&1; then
+        state="INSTALLED"
+    else
+        state="NOT_INSTALLED"
+    fi
+
+    echo "APP=$slug"
+    echo "RUNTIME_PROFILE=$profile"
+    echo "PHP_VERSION=$php_version"
+    echo "RUNTIME_IMAGE=$image"
+    echo "RUNTIME_STATE=$state"
+}
+
+set_runtime_profile_app() {
+    slug="$1"
+    profile="$2"
+    dir="$(app_root "$slug")"
+
+    [ -d "$dir" ] ||         die "application is not installed: $slug"
+
+    validate_runtime_profile "$profile"
+
+    old="$(app_runtime_profile "$slug")"
+
+    if [ "$old" = "$profile" ]; then
+        echo "APP=$slug"
+        echo "RUNTIME_PROFILE=$profile"
+        echo "RUNTIME_CHANGE=NONE"
+        return
+    fi
+
+    write_runtime_profile "$slug" "$profile"
+
+    image="$(runtime_image_for_profile "$profile")"
+
+    echo "APP=$slug"
+    echo "OLD_RUNTIME_PROFILE=$old"
+    echo "NEW_RUNTIME_PROFILE=$profile"
+
+    if docker image inspect "$image" >/dev/null 2>&1; then
+        echo "RUNTIME_IMAGE_STATE=INSTALLED"
+    else
+        echo "RUNTIME_IMAGE_STATE=BUILD_REQUIRED"
+    fi
+
+    echo "APPLY_REQUIRED=YES"
 }
 
 compose_cmd() {
@@ -84,7 +431,16 @@ compose_cmd() {
 
 ensure_layout() {
     slug="$1"
+    requested_profile="${2:-}"
     dir="$(app_root "$slug")"
+
+    load_runtime
+
+    if [ -z "$requested_profile" ]; then
+        requested_profile="$DEFAULT_RUNTIME_PROFILE"
+    fi
+
+    validate_runtime_profile "$requested_profile"
 
     mkdir -p \
         "$dir/config/tls" \
@@ -95,7 +451,8 @@ ensure_layout() {
         "$dir/data/storage/logs" \
         "$dir/data/bootstrap-cache" \
         "$dir/data/redis" \
-        "$dir/releases"
+        "$dir/releases" \
+        "$dir/state"
 
     if [ ! -f "$dir/config/tuning.cfg" ]; then
         install -m 0644 \
@@ -105,6 +462,14 @@ ensure_layout() {
         sed -i \
             "s/^APP_SLUG=.*/APP_SLUG=$slug/" \
             "$dir/config/tuning.cfg"
+    fi
+
+    if [ ! -f "$dir/config/runtime.cfg" ]; then
+        printf 'RUNTIME_PROFILE=%s\n' \
+            "$requested_profile" \
+            > "$dir/config/runtime.cfg"
+
+        chmod 0644 "$dir/config/runtime.cfg"
     fi
 
     if [ ! -f "$dir/config/.env" ]; then
@@ -167,6 +532,19 @@ render_compose() {
 
     load_runtime
 
+    runtime_cfg="$dir/config/runtime.cfg"
+
+    if [ ! -r "$runtime_cfg" ]; then
+        write_runtime_profile "$slug" "$DEFAULT_RUNTIME_PROFILE"
+    fi
+
+    runtime_profile="$(app_runtime_profile "$slug")"
+
+    validate_runtime_profile "$runtime_profile"
+    ensure_runtime_profile "$runtime_profile"
+
+    runtime_image="$(runtime_image_for_profile "$runtime_profile")"
+
     docker_cpus="$(cfg_get "$cfg" DOCKER_CPUS 0)"
     docker_memory="$(cfg_get "$cfg" DOCKER_MEMORY 0)"
     docker_reservation="$(cfg_get "$cfg" DOCKER_MEMORY_RESERVATION 0)"
@@ -178,9 +556,9 @@ render_compose() {
         cat <<EOF_YAML
 services:
   web:
-    image: $RUNTIME_IMAGE
+    image: $runtime_image
     container_name: secure-app-$slug-web
-    restart: unless-stopped
+    restart: "no"
 EOF_YAML
 
         [ "$docker_cpus" = "0" ] || \
@@ -213,7 +591,7 @@ EOF_YAML
   redis:
     image: $REDIS_IMAGE
     container_name: secure-app-$slug-redis
-    restart: unless-stopped
+    restart: "no"
 EOF_YAML
 
         [ "$redis_memory" = "0" ] || \
@@ -257,6 +635,265 @@ key_public_hash() {
         -outform DER 2>/dev/null |
     sha256sum |
     awk '{print $1}'
+}
+
+file_hash() {
+    file="$1"
+
+    if [ -f "$file" ]; then
+        sha256sum "$file" | awk '{print $1}'
+    else
+        printf '%s' "MISSING"
+    fi
+}
+
+validate_tls_config() {
+    slug="$1"
+    dir="$(app_root "$slug")"
+    cfg="$dir/config/tuning.cfg"
+
+    domain="$(cfg_get "$cfg" APP_DOMAIN CHANGE_ME)"
+
+    [ "$domain" != "CHANGE_ME" ] || \
+        die "set APP_DOMAIN in $cfg"
+
+    echo "$domain" | grep -Eq '^[A-Za-z0-9.-]+$' || \
+        die "invalid APP_DOMAIN: $domain"
+
+    cert="$dir/config/tls/ssl.crt"
+    key="$dir/config/tls/ssl.key"
+    ca="$dir/config/tls/ca.crt"
+
+    [ -r "$cert" ] || \
+        die "missing TLS certificate: $cert"
+
+    [ -r "$key" ] || \
+        die "missing TLS private key: $key"
+
+    cert_hash="$(cert_public_hash "$cert")"
+    key_hash="$(key_public_hash "$key")"
+
+    [ -n "$cert_hash" ] || \
+        die "unable to read TLS certificate"
+
+    [ -n "$key_hash" ] || \
+        die "unable to read TLS private key"
+
+    [ "$cert_hash" = "$key_hash" ] || \
+        die "TLS certificate and private key do not match"
+
+    openssl x509 \
+        -in "$cert" \
+        -noout \
+        -checkend 0 \
+        >/dev/null 2>&1 || \
+        die "TLS certificate is expired"
+
+    openssl x509 \
+        -in "$cert" \
+        -noout \
+        -checkhost "$domain" \
+        >/dev/null 2>&1 || \
+        die "TLS certificate does not contain domain: $domain"
+
+    echo "TLS_DOMAIN=$domain"
+    echo "TLS_NOT_BEFORE=$(
+        openssl x509 \
+            -in "$cert" \
+            -noout \
+            -startdate |
+        cut -d= -f2-
+    )"
+    echo "TLS_NOT_AFTER=$(
+        openssl x509 \
+            -in "$cert" \
+            -noout \
+            -enddate |
+        cut -d= -f2-
+    )"
+
+    if [ -r "$ca" ]; then
+        echo "TLS_CA=PRESENT"
+    else
+        echo "TLS_CA=NOT_PRESENT"
+    fi
+
+    echo "TLS_VALIDATION=PASS"
+}
+
+state_value() {
+    file="$1"
+    key="$2"
+
+    cfg_get "$file" "$key" ""
+}
+
+build_change_plan() {
+    slug="$1"
+    dir="$(app_root "$slug")"
+    state="$dir/state/applied.env"
+
+    PLAN_STATE="APPLIED"
+    PLAN_ENV="UNCHANGED"
+    PLAN_TUNING="UNCHANGED"
+    PLAN_TLS="UNCHANGED"
+    PLAN_RUNTIME="UNCHANGED"
+    PLAN_RELEASE="UNCHANGED"
+    PLAN_DOMAIN="UNCHANGED"
+    PLAN_WEB_RECREATE="NO"
+    PLAN_REDIS_RECREATE="NO"
+    PLAN_GATEWAY_RELOAD="NO"
+
+    current_env="$(file_hash "$dir/config/.env")"
+    current_tuning="$(file_hash "$dir/config/tuning.cfg")"
+    current_cert="$(file_hash "$dir/config/tls/ssl.crt")"
+    current_key="$(file_hash "$dir/config/tls/ssl.key")"
+    current_ca="$(file_hash "$dir/config/tls/ca.crt")"
+    current_runtime="$(app_runtime_profile "$slug")"
+    current_release="$(readlink "$dir/current" 2>/dev/null || true)"
+    current_domain="$(
+        cfg_get \
+            "$dir/config/tuning.cfg" \
+            APP_DOMAIN \
+            CHANGE_ME
+    )"
+
+    if [ ! -r "$state" ]; then
+        PLAN_STATE="NEVER_APPLIED"
+        PLAN_ENV="CHANGED"
+        PLAN_TUNING="CHANGED"
+        PLAN_TLS="CHANGED"
+        PLAN_RUNTIME="CHANGED"
+        PLAN_RELEASE="CHANGED"
+        PLAN_DOMAIN="CHANGED"
+        PLAN_WEB_RECREATE="YES"
+        PLAN_REDIS_RECREATE="YES"
+        PLAN_GATEWAY_RELOAD="YES"
+        return
+    fi
+
+    previous_env="$(state_value "$state" ENV_SHA256)"
+    previous_tuning="$(state_value "$state" TUNING_SHA256)"
+    previous_cert="$(state_value "$state" TLS_CERT_SHA256)"
+    previous_key="$(state_value "$state" TLS_KEY_SHA256)"
+    previous_ca="$(state_value "$state" TLS_CA_SHA256)"
+    previous_runtime="$(state_value "$state" RUNTIME_PROFILE)"
+    previous_release="$(state_value "$state" CURRENT_RELEASE)"
+    previous_domain="$(state_value "$state" APP_DOMAIN)"
+
+    if [ "$current_env" != "$previous_env" ]; then
+        PLAN_ENV="CHANGED"
+        PLAN_WEB_RECREATE="YES"
+    fi
+
+    if [ "$current_tuning" != "$previous_tuning" ]; then
+        PLAN_TUNING="CHANGED"
+        PLAN_WEB_RECREATE="YES"
+        PLAN_REDIS_RECREATE="YES"
+        PLAN_GATEWAY_RELOAD="YES"
+    fi
+
+    if [ "$current_cert" != "$previous_cert" ] || \
+       [ "$current_key" != "$previous_key" ] || \
+       [ "$current_ca" != "$previous_ca" ]; then
+        PLAN_TLS="CHANGED"
+        PLAN_GATEWAY_RELOAD="YES"
+    fi
+
+    if [ "$current_runtime" != "$previous_runtime" ]; then
+        PLAN_RUNTIME="CHANGED"
+        PLAN_WEB_RECREATE="YES"
+    fi
+
+    if [ "$current_release" != "$previous_release" ]; then
+        PLAN_RELEASE="CHANGED"
+        PLAN_WEB_RECREATE="YES"
+    fi
+
+    if [ "$current_domain" != "$previous_domain" ]; then
+        PLAN_DOMAIN="CHANGED"
+        PLAN_GATEWAY_RELOAD="YES"
+    fi
+}
+
+show_change_plan() {
+    slug="$1"
+
+    build_change_plan "$slug"
+
+    echo "APP=$slug"
+    echo "STATE=$PLAN_STATE"
+    echo "ENV=$PLAN_ENV"
+    echo "TUNING=$PLAN_TUNING"
+    echo "TLS=$PLAN_TLS"
+    echo "RUNTIME=$PLAN_RUNTIME"
+    echo "RELEASE=$PLAN_RELEASE"
+    echo "DOMAIN=$PLAN_DOMAIN"
+    echo
+    echo "WEB_RECREATE_REQUIRED=$PLAN_WEB_RECREATE"
+    echo "REDIS_RECREATE_REQUIRED=$PLAN_REDIS_RECREATE"
+    echo "GATEWAY_RELOAD_REQUIRED=$PLAN_GATEWAY_RELOAD"
+}
+
+write_applied_state() {
+    slug="$1"
+    dir="$(app_root "$slug")"
+    state="$dir/state/applied.env"
+    temp="$state.new"
+
+    mkdir -p "$dir/state"
+
+    cat > "$temp" <<EOF_STATE
+ENV_SHA256=$(file_hash "$dir/config/.env")
+TUNING_SHA256=$(file_hash "$dir/config/tuning.cfg")
+TLS_CERT_SHA256=$(file_hash "$dir/config/tls/ssl.crt")
+TLS_KEY_SHA256=$(file_hash "$dir/config/tls/ssl.key")
+TLS_CA_SHA256=$(file_hash "$dir/config/tls/ca.crt")
+RUNTIME_PROFILE=$(app_runtime_profile "$slug")
+CURRENT_RELEASE=$(readlink "$dir/current")
+APP_DOMAIN=$(cfg_get "$dir/config/tuning.cfg" APP_DOMAIN CHANGE_ME)
+EOF_STATE
+
+    chmod 0600 "$temp"
+    mv "$temp" "$state"
+}
+
+preflight_app() {
+    slug="$1"
+    dir="$(app_root "$slug")"
+
+    valid_slug "$slug" || \
+        die "invalid application slug: $slug"
+
+    [ -d "$dir" ] || \
+        die "application is not installed: $slug"
+
+    [ -L "$dir/current" ] || \
+        die "current release is missing"
+
+    [ -r "$dir/current/app/artisan" ] || \
+        die "Laravel artisan is missing"
+
+    [ -r "$dir/current/app/public/index.php" ] || \
+        die "public/index.php is missing"
+
+    [ -r "$dir/config/.env" ] || \
+        die ".env is missing"
+
+    [ -r "$dir/config/tuning.cfg" ] || \
+        die "tuning.cfg is missing"
+
+    profile="$(app_runtime_profile "$slug")"
+
+    validate_runtime_profile "$profile"
+
+    echo "APP=$slug"
+    echo "CURRENT_RELEASE=$(readlink "$dir/current")"
+    echo "RUNTIME_PROFILE=$profile"
+
+    validate_tls_config "$slug"
+
+    echo "PREFLIGHT=PASS"
 }
 
 register_gateway() {
@@ -393,6 +1030,17 @@ install_pack() {
     version="$(cfg_get "$manifest" APP_VERSION "")"
     security_mode="$(cfg_get "$manifest" SECURITY_MODE "")"
 
+    load_runtime
+
+    runtime_profile="$(
+        cfg_get \
+            "$manifest" \
+            RUNTIME_PROFILE \
+            "$DEFAULT_RUNTIME_PROFILE"
+    )"
+
+    validate_runtime_profile "$runtime_profile"
+
     [ "$format" = "1" ] || \
         die "unsupported SAPP_FORMAT: $format"
 
@@ -410,7 +1058,7 @@ install_pack() {
         sha256sum -c checksums.sha256
     )
 
-    ensure_layout "$slug"
+    ensure_layout "$slug" "$runtime_profile"
 
     dir="$(app_root "$slug")"
     release="$dir/releases/$version"
@@ -456,6 +1104,7 @@ install_pack() {
     echo "=== APPLICATION INSTALLED ==="
     echo "APP_SLUG=$slug"
     echo "APP_VERSION=$version"
+    echo "RUNTIME_PROFILE=$runtime_profile"
     echo "SECURITY_MODE=$security_mode"
     echo "APP_ROOT=$dir"
     echo
@@ -471,24 +1120,42 @@ install_pack() {
 apply_app() {
     slug="$1"
 
-    valid_slug "$slug" || \
-        die "invalid application slug: $slug"
-
-    dir="$(app_root "$slug")"
-
-    [ -d "$dir" ] || \
-        die "application is not installed: $slug"
+    require_unlocked
+    preflight_app "$slug" >/dev/null
+    build_change_plan "$slug"
 
     prepare_permissions "$slug"
     render_compose "$slug"
 
-    compose_cmd "$slug" \
-        up -d --force-recreate
+    if [ "$PLAN_WEB_RECREATE" = "YES" ] && \
+       [ "$PLAN_REDIS_RECREATE" = "YES" ]; then
+        compose_cmd "$slug" \
+            up -d --force-recreate
+    elif [ "$PLAN_REDIS_RECREATE" = "YES" ]; then
+        compose_cmd "$slug" \
+            up -d --force-recreate redis
 
-    register_gateway "$slug"
+        compose_cmd "$slug" \
+            up -d
+    elif [ "$PLAN_WEB_RECREATE" = "YES" ]; then
+        compose_cmd "$slug" \
+            up -d --force-recreate web
+    else
+        compose_cmd "$slug" \
+            up -d
+    fi
+
+    if [ "$PLAN_GATEWAY_RELOAD" = "YES" ]; then
+        register_gateway "$slug"
+    fi
+
+    write_applied_state "$slug"
 
     echo
     echo "APP=$slug"
+    echo "WEB_RECREATED=$PLAN_WEB_RECREATE"
+    echo "REDIS_RECREATED=$PLAN_REDIS_RECREATE"
+    echo "GATEWAY_RELOADED=$PLAN_GATEWAY_RELOAD"
     echo "APPLY=COMPLETE"
 }
 
@@ -530,6 +1197,11 @@ status_app() {
     if [ -L "$dir/previous" ]; then
         echo "PREVIOUS=$(readlink "$dir/previous")"
     fi
+
+    runtime_profile="$(app_runtime_profile "$slug")"
+
+    echo "RUNTIME_PROFILE=$runtime_profile"
+    echo "RUNTIME_IMAGE=$(runtime_image_for_profile "$runtime_profile")"
 
     compose_cmd "$slug" ps
 }
@@ -573,8 +1245,12 @@ doctor() {
 
     load_runtime
 
-    docker image inspect "$RUNTIME_IMAGE" >/dev/null 2>&1 || \
-        die "runtime image missing: $RUNTIME_IMAGE"
+    default_runtime_image="$(
+        runtime_image_for_profile "$DEFAULT_RUNTIME_PROFILE"
+    )"
+
+    docker image inspect "$default_runtime_image" >/dev/null 2>&1 || \
+        die "runtime image missing: $default_runtime_image"
 
     docker image inspect "$REDIS_IMAGE" >/dev/null 2>&1 || \
         die "Redis image missing: $REDIS_IMAGE"
@@ -585,7 +1261,8 @@ doctor() {
     docker inspect "$GATEWAY_CONTAINER" >/dev/null 2>&1 || \
         die "gateway container missing"
 
-    echo "RUNTIME_IMAGE=$RUNTIME_IMAGE"
+    echo "DEFAULT_RUNTIME_PROFILE=$DEFAULT_RUNTIME_PROFILE"
+    echo "RUNTIME_IMAGE=$default_runtime_image"
     echo "REDIS_IMAGE=$REDIS_IMAGE"
 
     sysctl vm.overcommit_memory
@@ -595,12 +1272,764 @@ doctor() {
     echo "DOCTOR=PASS"
 }
 
+pause_console() {
+    printf '\nPress Enter to continue...' >/dev/tty
+    IFS= read -r _pause </dev/tty
+}
+
+read_choice() {
+    prompt="$1"
+    printf '%s' "$prompt" >/dev/tty
+    IFS= read -r choice </dev/tty
+    printf '%s' "$choice"
+}
+
+choose_app() {
+    tmp="$(mktemp)"
+
+    list_apps | awk '{print $1}' > "$tmp"
+
+    if [ ! -s "$tmp" ]; then
+        rm -f "$tmp"
+        echo "NO_APPS"
+        return
+    fi
+
+    echo
+    echo "Installed applications"
+    echo
+
+    n=1
+
+    while IFS= read -r slug
+    do
+        printf '%s. %s\n' "$n" "$slug"
+        n=$((n + 1))
+    done < "$tmp"
+
+    echo
+    choice="$(read_choice 'Select application or B to go back: ')"
+
+    case "$choice" in
+        b|B)
+            rm -f "$tmp"
+            echo "BACK"
+            return
+            ;;
+    esac
+
+    echo "$choice" | grep -Eq '^[0-9]+$' || {
+        rm -f "$tmp"
+        echo "INVALID"
+        return
+    }
+
+    slug="$(sed -n "${choice}p" "$tmp")"
+    rm -f "$tmp"
+
+    if [ -z "$slug" ]; then
+        echo "INVALID"
+        return
+    fi
+
+    echo "$slug"
+}
+
+run_editor() {
+    file="$1"
+
+    [ -e "$file" ] || \
+        die "file does not exist: $file"
+
+    if command -v nano >/dev/null 2>&1; then
+        nano "$file"
+    elif command -v vi >/dev/null 2>&1; then
+        vi "$file"
+    else
+        die "no text editor is installed"
+    fi
+}
+
+offer_apply_changes() {
+    slug="$1"
+
+    echo
+    show_change_plan "$slug"
+    echo
+    echo "Running validation before apply."
+    echo
+
+    if ! (
+        preflight_app "$slug"
+    ); then
+        echo
+        echo "VALIDATION=FAILED"
+        echo "Changes were saved but were not applied."
+        pause_console
+        return
+    fi
+
+    echo
+    confirm="$(read_choice 'Apply required service changes now? [y/N]: ')"
+
+    case "$confirm" in
+        y|Y|yes|YES)
+            apply_app "$slug"
+            ;;
+        *)
+            echo "Changes remain pending."
+            ;;
+    esac
+
+    pause_console
+}
+
+edit_env_menu() {
+    slug="$1"
+    file="$(app_root "$slug")/config/.env"
+
+    [ -f "$file" ] || \
+        die ".env does not exist: $file"
+
+    before="$(file_hash "$file")"
+
+    run_editor "$file"
+
+    after="$(file_hash "$file")"
+
+    echo
+
+    if [ "$before" = "$after" ]; then
+        echo "ENV_CHANGE=NONE"
+        pause_console
+        return
+    fi
+
+    echo "ENV_CHANGE=DETECTED"
+
+    chmod 0600 "$file"
+
+    offer_apply_changes "$slug"
+}
+
+edit_tuning_menu() {
+    slug="$1"
+    file="$(app_root "$slug")/config/tuning.cfg"
+
+    [ -f "$file" ] || \
+        die "tuning.cfg does not exist: $file"
+
+    before="$(file_hash "$file")"
+
+    run_editor "$file"
+
+    after="$(file_hash "$file")"
+
+    echo
+
+    if [ "$before" = "$after" ]; then
+        echo "TUNING_CHANGE=NONE"
+        pause_console
+        return
+    fi
+
+    echo "TUNING_CHANGE=DETECTED"
+
+    offer_apply_changes "$slug"
+}
+
+validate_tls_source_files() {
+    cert="$1"
+    key="$2"
+    ca="$3"
+    domain="$4"
+
+    [ -r "$cert" ] || {
+        echo "ERROR: certificate path is not readable: $cert"
+        return 1
+    }
+
+    [ -r "$key" ] || {
+        echo "ERROR: private key path is not readable: $key"
+        return 1
+    }
+
+    cert_hash="$(cert_public_hash "$cert")"
+    key_hash="$(key_public_hash "$key")"
+
+    [ -n "$cert_hash" ] || {
+        echo "ERROR: certificate could not be parsed"
+        return 1
+    }
+
+    [ -n "$key_hash" ] || {
+        echo "ERROR: private key could not be parsed"
+        return 1
+    }
+
+    [ "$cert_hash" = "$key_hash" ] || {
+        echo "ERROR: certificate and private key do not match"
+        return 1
+    }
+
+    openssl x509 \
+        -in "$cert" \
+        -noout \
+        -checkend 0 \
+        >/dev/null 2>&1 || {
+            echo "ERROR: certificate is expired"
+            return 1
+        }
+
+    openssl x509 \
+        -in "$cert" \
+        -noout \
+        -checkhost "$domain" \
+        >/dev/null 2>&1 || {
+            echo "ERROR: certificate does not contain domain: $domain"
+            echo
+            echo "Certificate names:"
+            openssl x509 \
+                -in "$cert" \
+                -noout \
+                -ext subjectAltName 2>/dev/null || true
+            return 1
+        }
+
+    if [ -n "$ca" ]; then
+        [ -r "$ca" ] || {
+            echo "ERROR: CA/fullchain path is not readable: $ca"
+            return 1
+        }
+
+        openssl x509 \
+            -in "$ca" \
+            -noout \
+            >/dev/null 2>&1 || {
+                echo "ERROR: CA/fullchain file could not be parsed"
+                return 1
+            }
+    fi
+
+    echo "CERTIFICATE_KEY_MATCH=PASS"
+    echo "CERTIFICATE_DOMAIN_MATCH=PASS"
+    echo "CERTIFICATE_EXPIRY=PASS"
+    echo "DOMAIN=$domain"
+    echo "NOT_BEFORE=$(
+        openssl x509 \
+            -in "$cert" \
+            -noout \
+            -startdate |
+        cut -d= -f2-
+    )"
+    echo "NOT_AFTER=$(
+        openssl x509 \
+            -in "$cert" \
+            -noout \
+            -enddate |
+        cut -d= -f2-
+    )"
+
+    return 0
+}
+
+update_tls_menu() {
+    slug="$1"
+    dir="$(app_root "$slug")"
+    cfg="$dir/config/tuning.cfg"
+    domain="$(cfg_get "$cfg" APP_DOMAIN CHANGE_ME)"
+
+    echo
+    echo "Application domain: $domain"
+    echo
+
+    [ "$domain" != "CHANGE_ME" ] || {
+        echo "Set APP_DOMAIN in tuning.cfg before installing TLS."
+        pause_console
+        return
+    }
+
+    cert="$(read_choice 'Certificate path: ')"
+
+    [ -n "$cert" ] || {
+        echo "No certificate path entered."
+        pause_console
+        return
+    }
+
+    key="$(read_choice 'Private key path: ')"
+
+    [ -n "$key" ] || {
+        echo "No private key path entered."
+        pause_console
+        return
+    }
+
+    ca="$(read_choice 'CA/fullchain path, or press Enter if none: ')"
+
+    echo
+    echo "Validating TLS files."
+    echo
+
+    if ! validate_tls_source_files \
+        "$cert" \
+        "$key" \
+        "$ca" \
+        "$domain"
+    then
+        echo
+        echo "TLS_UPDATE=REJECTED"
+        echo "Existing TLS files were not changed."
+        pause_console
+        return
+    fi
+
+    echo
+    confirm="$(read_choice 'Install these TLS files? [y/N]: ')"
+
+    case "$confirm" in
+        y|Y|yes|YES)
+            ;;
+        *)
+            echo "TLS update cancelled."
+            pause_console
+            return
+            ;;
+    esac
+
+    tls="$dir/config/tls"
+    tmp="$(mktemp -d)"
+
+    install -m 0644 "$cert" "$tmp/ssl.crt"
+    install -m 0600 "$key" "$tmp/ssl.key"
+
+    if [ -n "$ca" ]; then
+        install -m 0644 "$ca" "$tmp/ca.crt"
+    fi
+
+    install -d -m 0755 "$tls"
+
+    install -m 0644 \
+        "$tmp/ssl.crt" \
+        "$tls/ssl.crt"
+
+    install -m 0600 \
+        "$tmp/ssl.key" \
+        "$tls/ssl.key"
+
+    if [ -f "$tmp/ca.crt" ]; then
+        install -m 0644 \
+            "$tmp/ca.crt" \
+            "$tls/ca.crt"
+    else
+        rm -f "$tls/ca.crt"
+    fi
+
+    rm -rf "$tmp"
+
+    echo
+    echo "TLS_UPDATE=INSTALLED"
+
+    offer_apply_changes "$slug"
+}
+
+install_package_menu() {
+    echo
+    echo "Install application package"
+    echo
+
+    pack="$(read_choice 'Package path: ')"
+
+    [ -n "$pack" ] || {
+        echo "No package path entered."
+        pause_console
+        return
+    }
+
+    [ -r "$pack" ] || {
+        echo "ERROR: package is not readable: $pack"
+        pause_console
+        return
+    }
+
+    echo
+    echo "Package:"
+    echo "$pack"
+    echo
+
+    confirm="$(read_choice 'Install this package? [y/N]: ')"
+
+    case "$confirm" in
+        y|Y|yes|YES)
+            install_pack "$pack"
+            ;;
+        *)
+            echo "Installation cancelled."
+            ;;
+    esac
+
+    pause_console
+}
+
+runtime_menu() {
+    while :
+    do
+        clear 2>/dev/null || true
+
+        echo "SECURE APP APPLIANCE"
+        echo
+        echo "Runtime management"
+        echo
+        list_runtime_profiles
+        echo
+        echo "1. Build runtime profile"
+        echo "2. Back"
+        echo
+
+        choice="$(read_choice 'Select: ')"
+
+        case "$choice" in
+            1)
+                echo
+                profile="$(read_choice 'Runtime profile, for example php84: ')"
+
+                if [ -z "$profile" ]; then
+                    echo "No runtime profile entered."
+                else
+                    load_runtime
+
+                    if validate_runtime_profile "$profile"; then
+                        ensure_runtime_profile "$profile"
+                        echo "RUNTIME_BUILD=COMPLETE"
+                    fi
+                fi
+
+                pause_console
+                ;;
+            2|b|B)
+                return
+                ;;
+            *)
+                echo "Invalid selection."
+                pause_console
+                ;;
+        esac
+    done
+}
+
+change_runtime_menu() {
+    slug="$1"
+
+    echo
+    echo "Available runtime profiles"
+    echo
+    list_runtime_profiles
+    echo
+
+    current="$(app_runtime_profile "$slug")"
+
+    echo
+    echo "Current runtime: $current"
+    echo
+
+    profile="$(read_choice 'New runtime profile or B to cancel: ')"
+
+    case "$profile" in
+        b|B|"")
+            return
+            ;;
+    esac
+
+    validate_runtime_profile "$profile" || return
+
+    if [ "$profile" = "$current" ]; then
+        echo "Runtime is already set to $profile."
+        pause_console
+        return
+    fi
+
+    image="$(runtime_image_for_profile "$profile")"
+
+    if docker image inspect "$image" >/dev/null 2>&1; then
+        echo "Runtime image already exists."
+    else
+        echo "Runtime image is not installed."
+        confirm="$(read_choice 'Build it now? [y/N]: ')"
+
+        case "$confirm" in
+            y|Y|yes|YES)
+                ensure_runtime_profile "$profile"
+                ;;
+            *)
+                echo "Runtime change cancelled."
+                pause_console
+                return
+                ;;
+        esac
+    fi
+
+    echo
+    echo "Application: $slug"
+    echo "Current runtime: $current"
+    echo "New runtime: $profile"
+    echo
+
+    confirm="$(read_choice 'Switch runtime and recreate the application? [y/N]: ')"
+
+    case "$confirm" in
+        y|Y|yes|YES)
+            write_runtime_profile "$slug" "$profile"
+            apply_app "$slug"
+            ;;
+        *)
+            echo "Runtime change cancelled."
+            ;;
+    esac
+
+    pause_console
+}
+
+manage_app_menu() {
+    slug="$1"
+
+    while :
+    do
+        clear 2>/dev/null || true
+
+        echo "SECURE APP APPLIANCE"
+        echo
+        echo "Application: $slug"
+        echo "Runtime: $(app_runtime_profile "$slug")"
+        echo
+        echo "1. Status"
+        echo "2. Edit .env"
+        echo "3. Edit tuning"
+        echo "4. Update TLS"
+        echo "5. Check pending changes"
+        echo "6. Apply pending changes"
+        echo "7. Change PHP runtime"
+        echo "8. Runtime details"
+        echo "9. Logs"
+        echo "10. Restart"
+        echo "11. Stop"
+        echo "12. Start"
+        echo "13. Rollback"
+        echo "14. Back"
+        echo
+
+        choice="$(read_choice 'Select: ')"
+
+        case "$choice" in
+            1)
+                status_app "$slug"
+                pause_console
+                ;;
+            2)
+                edit_env_menu "$slug"
+                ;;
+            3)
+                edit_tuning_menu "$slug"
+                ;;
+            4)
+                update_tls_menu "$slug"
+                ;;
+            5)
+                echo
+                if (
+                    preflight_app "$slug"
+                ); then
+                    echo
+                    show_change_plan "$slug"
+                else
+                    echo
+                    echo "PREFLIGHT=FAILED"
+                fi
+                pause_console
+                ;;
+            6)
+                echo
+                if ! (
+                    preflight_app "$slug"
+                ); then
+                    echo
+                    echo "PREFLIGHT=FAILED"
+                    echo "Nothing was applied."
+                    pause_console
+                    continue
+                fi
+
+                echo
+                show_change_plan "$slug"
+                echo
+
+                confirm="$(read_choice 'Apply these changes? [y/N]: ')"
+
+                case "$confirm" in
+                    y|Y|yes|YES)
+                        apply_app "$slug"
+                        ;;
+                    *)
+                        echo "Apply cancelled."
+                        ;;
+                esac
+
+                pause_console
+                ;;
+            7)
+                change_runtime_menu "$slug"
+                ;;
+            8)
+                runtime_status_app "$slug"
+                pause_console
+                ;;
+            9)
+                compose_cmd "$slug" logs --tail=200
+                pause_console
+                ;;
+            10)
+                apply_app "$slug"
+                pause_console
+                ;;
+            11)
+                compose_cmd "$slug" stop
+                pause_console
+                ;;
+            12)
+                preflight_app "$slug"
+                prepare_permissions "$slug"
+                render_compose "$slug"
+                compose_cmd "$slug" up -d
+                register_gateway "$slug"
+                write_applied_state "$slug"
+                pause_console
+                ;;
+            13)
+                confirm="$(read_choice 'Rollback to previous release? [y/N]: ')"
+
+                case "$confirm" in
+                    y|Y|yes|YES)
+                        rollback_app "$slug"
+                        ;;
+                    *)
+                        echo "Rollback cancelled."
+                        ;;
+                esac
+
+                pause_console
+                ;;
+            14|b|B)
+                return
+                ;;
+            *)
+                echo "Invalid selection."
+                pause_console
+                ;;
+        esac
+    done
+}
+
+select_app_menu() {
+    selected="$(choose_app)"
+
+    case "$selected" in
+        NO_APPS)
+            echo "No applications are installed."
+            pause_console
+            return
+            ;;
+        BACK)
+            return
+            ;;
+        INVALID)
+            echo "Invalid application selection."
+            pause_console
+            return
+            ;;
+    esac
+
+    manage_app_menu "$selected"
+}
+
+interactive_menu() {
+    while :
+    do
+        clear 2>/dev/null || true
+
+        echo "SECURE APP APPLIANCE"
+        echo
+        echo "Appliance: UNLOCKED"
+        echo
+        echo "1. Manage installed application"
+        echo "2. Install application package"
+        echo "3. Runtime management"
+        echo "4. Server health check"
+        echo "5. List installed applications"
+        echo "6. Lock applications"
+        echo "7. Exit"
+        echo
+
+        choice="$(read_choice 'Select: ')"
+
+        case "$choice" in
+            1)
+                select_app_menu
+                ;;
+            2)
+                install_package_menu
+                ;;
+            3)
+                runtime_menu
+                ;;
+            4)
+                doctor
+                pause_console
+                ;;
+            5)
+                echo
+                list_apps
+                pause_console
+                ;;
+            6)
+                echo
+                confirm="$(read_choice 'Stop all applications and lock appliance? [y/N]: ')"
+
+                case "$confirm" in
+                    y|Y|yes|YES)
+                        lock_appliance
+                        return
+                        ;;
+                    *)
+                        echo "Lock cancelled."
+                        pause_console
+                        ;;
+                esac
+                ;;
+            7|q|Q)
+                return
+                ;;
+            *)
+                echo "Invalid selection."
+                pause_console
+                ;;
+        esac
+    done
+}
+
 usage() {
     cat <<'EOF_USAGE'
 Usage:
 
   appctl doctor
   appctl list
+  appctl unlock
+  appctl lock
+
+  appctl runtime-list
+  appctl runtime-status <app-slug>
+  appctl runtime-set <app-slug> <profile>
+  appctl runtime-build <profile>
+
+  appctl check <app-slug>
 
   appctl install <package.sapp>
   appctl deploy <package.sapp>
@@ -619,9 +2048,22 @@ EOF_USAGE
     exit 1
 }
 
-need_root
+need_root "$@"
 
 command="${1:-}"
+
+if [ ! -f "$INSTALL_MARKER" ]; then
+    verify_product_session
+
+    if [ "$command" != "lock" ]; then
+        unlock_appliance
+    fi
+fi
+
+if [ -z "$command" ]; then
+    interactive_menu
+    exit 0
+fi
 
 case "$command" in
     doctor)
@@ -630,6 +2072,46 @@ case "$command" in
 
     list)
         list_apps
+        ;;
+
+    unlock)
+        [ "$#" -eq 1 ] || usage
+        unlock_appliance
+        ;;
+
+    lock)
+        [ "$#" -eq 1 ] || usage
+        lock_appliance
+        ;;
+
+    runtime-list)
+        [ "$#" -eq 1 ] || usage
+        list_runtime_profiles
+        ;;
+
+    runtime-status)
+        [ "$#" -eq 2 ] || usage
+        runtime_status_app "$2"
+        ;;
+
+    runtime-set)
+        [ "$#" -eq 3 ] || usage
+        set_runtime_profile_app "$2" "$3"
+        ;;
+
+    runtime-build)
+        [ "$#" -eq 2 ] || usage
+        load_runtime
+        ensure_runtime_profile "$2"
+        echo "RUNTIME_PROFILE=$2"
+        echo "RUNTIME_BUILD=COMPLETE"
+        ;;
+
+    check)
+        [ "$#" -eq 2 ] || usage
+        preflight_app "$2"
+        echo
+        show_change_plan "$2"
         ;;
 
     install|deploy)
