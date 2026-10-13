@@ -197,6 +197,8 @@ AllowAgentForwarding yes
 PubkeyAuthentication yes
 EOF_SSHD
 
+install -d -m 0755 /run/sshd
+
 /usr/sbin/sshd -t
 
 cat > /etc/sudoers.d/secure-app-appliance <<EOF_SUDOERS

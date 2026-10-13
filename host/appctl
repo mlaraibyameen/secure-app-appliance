@@ -1543,6 +1543,48 @@ apply_app() {
     echo "APPLY=COMPLETE"
 }
 
+artisan_app() {
+    artisan_slug="$1"
+    shift
+
+    [ "$#" -gt 0 ] || die "Artisan command is required"
+
+    require_unlocked
+    preflight_app "$artisan_slug" >/dev/null
+
+    [ "$(app_security_mode "$artisan_slug")" = "SWS_V1" ] || \
+        die "Artisan command requires an SWS-protected release"
+
+    artisan_config="$(app_root "$artisan_slug")/config/tuning.cfg"
+
+    artisan_uid="$(cfg_get "$artisan_config" APP_RUNTIME_UID 10001)"
+    artisan_gid="$(cfg_get "$artisan_config" APP_RUNTIME_GID 10001)"
+
+    echo "$artisan_uid" | grep -Eq '^[0-9]+$' || \
+        die "Invalid application UID"
+
+    echo "$artisan_gid" | grep -Eq '^[0-9]+$' || \
+        die "Invalid application GID"
+
+    artisan_container="secure-app-$artisan_slug-web"
+
+    [ "$(
+        docker inspect -f '{{.State.Running}}' \
+            "$artisan_container" 2>/dev/null || true
+    )" = "true" ] || die "Application web container is not running"
+
+    artisan_master="$(derive_sws_master "$artisan_slug")"
+
+    printf '%s\n' "$artisan_master" | \
+        docker exec -i \
+            -u "$artisan_uid:$artisan_gid" \
+            "$artisan_container" \
+            /usr/local/bin/sws-keyhold \
+            php -r 'require "/opt/app/artisan";' -- "$@"
+
+    artisan_master=""
+}
+
 rollback_app() {
     slug="$1"
     dir="$(app_root "$slug")"
@@ -2429,7 +2471,7 @@ Usage:
   appctl status <app-slug>
   appctl logs <app-slug>
 
-  appctl rollback <app-slug>
+  appctl artisan <app-slug> <artisan-command>\n\n  appctl rollback <app-slug>
 EOF_USAGE
 
     exit 1
@@ -2541,6 +2583,13 @@ case "$command" in
     logs)
         [ "$#" -eq 2 ] || usage
         compose_cmd "$2" logs --tail=200
+        ;;
+
+    artisan)
+        [ "$#" -ge 3 ] || usage
+        artisan_target="$2"
+        shift 2
+        artisan_app "$artisan_target" "$@"
         ;;
 
     rollback)
