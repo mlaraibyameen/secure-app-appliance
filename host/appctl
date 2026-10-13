@@ -683,6 +683,8 @@ runtime_status_app() {
 
     [ -d "$dir" ] ||         die "application is not installed: $slug"
 
+    load_runtime
+
     profile="$(app_runtime_profile "$slug")"
 
     validate_runtime_profile "$profile"
@@ -1351,6 +1353,23 @@ install_pack() {
     slug="$(cfg_get "$manifest" APP_SLUG "")"
     version="$(cfg_get "$manifest" APP_VERSION "")"
     security_mode="$(cfg_get "$manifest" SECURITY_MODE "")"
+    assets_format="$(cfg_get "$manifest" PUBLIC_ASSETS_FORMAT "")"
+
+    case "$assets_format" in
+        "")
+            ;;
+        1)
+            [ -r "$tmp/payload/public-assets.tar.gz" ] || \
+                die "public asset payload missing"
+
+            grep -Eq '^[0-9a-f]{64}  payload/public-assets.tar.gz$' \
+                "$tmp/checksums.sha256" || \
+                die "public asset checksum missing"
+            ;;
+        *)
+            die "unsupported PUBLIC_ASSETS_FORMAT: $assets_format"
+            ;;
+    esac
 
     load_runtime
 
@@ -1396,6 +1415,23 @@ install_pack() {
     tar \
         -xzf "$tmp/payload/app.tar.gz" \
         -C "$release/app"
+
+    if [ "$assets_format" = "1" ]; then
+        mkdir -p "$release/public-assets"
+
+        tar -xzf "$tmp/payload/public-assets.tar.gz" \
+            -C "$release/public-assets"
+
+        [ ! -e "$release/public-assets/students" ] && \
+        [ ! -L "$release/public-assets/students" ] || \
+            die "student uploads included in release"
+
+        if find "$release/public-assets" -type l -print -quit | grep -q .; then
+            die "public asset payload contains symlinks"
+        fi
+
+        echo "VERSIONED_PUBLIC_ASSETS=INSTALLED"
+    fi
 
     install -m 0644 \
         "$manifest" \
@@ -1448,6 +1484,20 @@ install_pack() {
     fi
 }
 
+sync_versioned_assets() {
+    sync_slug="$1"
+    sync_dir="$(app_root "$sync_slug")"
+    sync_manifest="$sync_dir/current/manifest.env"
+    sync_format="$(cfg_get "$sync_manifest" PUBLIC_ASSETS_FORMAT "")"
+
+    [ "$sync_format" = "1" ] || return 0
+
+    python3 "$SHARE/sync-public-assets.py" \
+        "$sync_dir/current/public-assets" \
+        "$sync_dir/data/storage/app/public" \
+        "$sync_dir/state/managed-public-assets.json"
+}
+
 apply_app() {
     slug="$1"
 
@@ -1455,6 +1505,7 @@ apply_app() {
     preflight_app "$slug" >/dev/null
     build_change_plan "$slug"
 
+    sync_versioned_assets "$slug"
     prepare_permissions "$slug"
     render_compose "$slug"
 
@@ -1530,6 +1581,8 @@ status_app() {
     if [ -L "$dir/previous" ]; then
         echo "PREVIOUS=$(readlink "$dir/previous")"
     fi
+
+    load_runtime
 
     runtime_profile="$(app_runtime_profile "$slug")"
 

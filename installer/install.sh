@@ -44,7 +44,8 @@ apt-get install -y \
     openssl \
     openssh-server \
     sudo \
-    nano
+    nano \
+    python3
 
 install -m 0755 -d /etc/apt/keyrings
 
@@ -105,6 +106,10 @@ install -m 0644 \
 install -m 0755 \
     "$BASE/host/appctl" \
     /usr/local/bin/appctl
+
+install -m 0644 \
+    "$BASE/host/sync-public-assets.py" \
+    /usr/share/secure-app-appliance/sync-public-assets.py
 
 install -m 0644 \
     "$BASE/keys/product_unlock_ed25519.pub" \

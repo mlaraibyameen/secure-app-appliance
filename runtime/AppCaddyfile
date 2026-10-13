@@ -7,7 +7,20 @@
 
     encode zstd gzip
 
-    php_fastcgi 127.0.0.1:9000
+    @storageRequests path /storage /storage/*
 
-    file_server
+    handle @storageRequests {
+        @blockedStorageScripts path_regexp (?i)^/storage/.*\.(?:php[0-9]*|phtml|phar|pht|phps)(?:/|$)
+        @blockedStorageDotfiles path_regexp (?i)^/storage/(?:[^/]+/)*\.[^/]+(?:/|$)
+
+        respond @blockedStorageScripts 403
+        respond @blockedStorageDotfiles 403
+
+        file_server
+    }
+
+    handle {
+        php_fastcgi 127.0.0.1:9000
+        file_server
+    }
 }

@@ -84,7 +84,7 @@ for path in stage.rglob("*"):
     except OSError:
         continue
 
-    if b"<?php" not in data:
+    if b"<?php" not in data and not name_lower.endswith(".blade.php"):
         continue
 
     removable = (
@@ -184,7 +184,7 @@ for path in stage.rglob("*"):
     except OSError:
         continue
 
-    if b"<?php" in data:
+    if b"<?php" in data or path.name.lower().endswith(".blade.php"):
         remaining_plaintext.append(
             path.relative_to(stage).as_posix()
         )

@@ -45,6 +45,10 @@ install -m 0755 \
     "$STAGE/host/appctl"
 
 install -m 0644 \
+    "$ROOT/host/sync-public-assets.py" \
+    "$STAGE/host/sync-public-assets.py"
+
+install -m 0644 \
     "$ROOT/host/templates/tuning.cfg" \
     "$STAGE/host/templates/tuning.cfg"
 

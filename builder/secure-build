@@ -96,6 +96,7 @@ fi
 
 WORK="$ROOT/build/packs/$APP_SLUG/$APP_VERSION"
 STAGE="$WORK/app"
+ASSET_STAGE="$WORK/public-assets"
 PACKAGE="$WORK/package"
 DIST="$ROOT/dist"
 
@@ -103,6 +104,7 @@ rm -rf "$WORK"
 
 mkdir -p \
     "$STAGE" \
+    "$ASSET_STAGE" \
     "$PACKAGE/payload" \
     "$DIST"
 
@@ -121,6 +123,35 @@ rsync -a \
     --exclude='*.tar.zst' \
     "$APP_PATH/" \
     "$STAGE/"
+
+if [ -d "$APP_PATH/storage/app/public" ]; then
+    rsync -a \
+        --exclude='/students/***' \
+        "$APP_PATH/storage/app/public/" \
+        "$ASSET_STAGE/"
+fi
+
+if [ -e "$ASSET_STAGE/students" ] || [ -L "$ASSET_STAGE/students" ]; then
+    echo "ERROR: students directory included in asset stage" >&2
+    exit 1
+fi
+
+if find "$ASSET_STAGE" -type l -print -quit | grep -q .; then
+    echo "ERROR: symlinks are not allowed in public asset payload" >&2
+    exit 1
+fi
+
+if find "$ASSET_STAGE" -type f \( \
+    -name '.env' -o -name '.env.*' \
+    -o -name '*.pem' -o -name '*.key' \
+    -o -name '*.p12' -o -name '*.pfx' \
+\) -print -quit | grep -q .; then
+    echo "ERROR: sensitive file found in public assets" >&2
+    exit 1
+fi
+
+echo "PUBLIC_ASSET_FILES=$(find "$ASSET_STAGE" -type f | wc -l)"
+echo "STUDENT_UPLOADS_INCLUDED=NO"
 
 mkdir -p "$STAGE/storage"
 
@@ -205,12 +236,18 @@ tar \
     -czf "$PACKAGE/payload/app.tar.gz" \
     .
 
+tar \
+    -C "$ASSET_STAGE" \
+    -czf "$PACKAGE/payload/public-assets.tar.gz" \
+    .
+
 cat > "$PACKAGE/manifest.env" <<EOF_MANIFEST
 SAPP_FORMAT=1
 APP_SLUG=$APP_SLUG
 APP_VERSION=$APP_VERSION
 RUNTIME_PROFILE=$RUNTIME_PROFILE
 SECURITY_MODE=$SECURITY_MODE
+PUBLIC_ASSETS_FORMAT=1
 SWS_FORMAT=$SWS_FORMAT
 SWS_NAMESPACE=$SWS_NAMESPACE
 SWS_CHALLENGE=$SWS_CHALLENGE
@@ -220,7 +257,7 @@ EOF_MANIFEST
 
 (
     cd "$PACKAGE"
-    sha256sum payload/app.tar.gz > checksums.sha256
+    sha256sum payload/app.tar.gz payload/public-assets.tar.gz > checksums.sha256
 )
 
 OUTPUT="$DIST/$APP_SLUG-$APP_VERSION.sapp"
