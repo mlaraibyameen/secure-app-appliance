@@ -153,7 +153,7 @@ fi
 echo "PUBLIC_ASSET_FILES=$(find "$ASSET_STAGE" -type f | wc -l)"
 echo "STUDENT_UPLOADS_INCLUDED=NO"
 
-mkdir -p "$STAGE/storage"
+mkdir -p "$STAGE/storage" "$STAGE/bootstrap/cache"
 
 rm -rf "$STAGE/public/storage"
 ln -s ../storage/app/public "$STAGE/public/storage"
